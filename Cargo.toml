@@ -1,0 +1,18 @@
+[package]
+name = "codex-switch-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "codex-switch"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", features = ["process", "signal"] }
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
