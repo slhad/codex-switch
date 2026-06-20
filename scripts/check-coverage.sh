@@ -7,13 +7,25 @@ COVERAGE_TARGET_DIR="target/coverage-target"
 PROFRAW_DIR="$COVERAGE_DIR/profraw"
 PROFDATA="$COVERAGE_DIR/codex-switch.profdata"
 
-if ! command -v llvm-profdata >/dev/null 2>&1; then
-  echo "llvm-profdata is required to check coverage" >&2
+host_triple=$(rustc -vV | sed -n 's/^host: //p')
+rust_llvm_tools="$(rustc --print sysroot)/lib/rustlib/$host_triple/bin"
+LLVM_PROFDATA="${LLVM_PROFDATA:-$rust_llvm_tools/llvm-profdata}"
+LLVM_COV="${LLVM_COV:-$rust_llvm_tools/llvm-cov}"
+
+if [[ ! -x "$LLVM_PROFDATA" ]]; then
+  LLVM_PROFDATA=$(command -v llvm-profdata || true)
+fi
+if [[ ! -x "$LLVM_COV" ]]; then
+  LLVM_COV=$(command -v llvm-cov || true)
+fi
+
+if [[ -z "$LLVM_PROFDATA" || ! -x "$LLVM_PROFDATA" ]]; then
+  echo "llvm-profdata is required to check coverage; install rustup component llvm-tools-preview" >&2
   exit 1
 fi
 
-if ! command -v llvm-cov >/dev/null 2>&1; then
-  echo "llvm-cov is required to check coverage" >&2
+if [[ -z "$LLVM_COV" || ! -x "$LLVM_COV" ]]; then
+  echo "llvm-cov is required to check coverage; install rustup component llvm-tools-preview" >&2
   exit 1
 fi
 
@@ -25,7 +37,7 @@ RUSTFLAGS="-Cinstrument-coverage" \
 LLVM_PROFILE_FILE="$(pwd)/$PROFRAW_DIR/%p-%m.profraw" \
 cargo test
 
-llvm-profdata merge -sparse "$PROFRAW_DIR"/*.profraw -o "$PROFDATA"
+"$LLVM_PROFDATA" merge -sparse "$PROFRAW_DIR"/*.profraw -o "$PROFDATA"
 
 mapfile -t OBJECTS < <(find "$COVERAGE_TARGET_DIR/debug/deps" -maxdepth 1 -type f -perm -111 ! -name "*.so" | sort)
 if [[ "${#OBJECTS[@]}" -eq 0 ]]; then
@@ -40,12 +52,12 @@ for object in "${OBJECTS[@]}"; do
   REPORT_ARGS+=("--object" "$object")
 done
 
-llvm-cov report \
+"$LLVM_COV" report \
   "${REPORT_ARGS[@]}" \
   --instr-profile="$PROFDATA" \
   --ignore-filename-regex="$IGNORE_REGEX"
 
-coverage_json=$(llvm-cov export \
+coverage_json=$("$LLVM_COV" export \
   "${REPORT_ARGS[@]}" \
   --summary-only \
   --instr-profile="$PROFDATA" \

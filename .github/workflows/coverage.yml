@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install LLVM coverage tools
-        run: sudo apt-get update && sudo apt-get install -y llvm
+        with:
+          components: llvm-tools-preview
       - name: Enforce coverage >= 80%
         run: scripts/check-coverage.sh
