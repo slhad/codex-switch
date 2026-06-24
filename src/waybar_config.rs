@@ -2,7 +2,36 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CODEX_USAGE_MODULE: &str = "custom/codex-usage";
-const WAYBAR_EXEC: &str = "codex-switch --waybar --format '<span font_family=\"bootstrap-icons\" rise=\"1200\" color=\"#5f78ff\">{icon_plain}</span> {5h_pct}% <span color=\"#5f78ff\">󰥔</span> {5h_reset} <span font_family=\"bootstrap-icons\" rise=\"1200\" color=\"#5f78ff\">{icon_plain}</span> {7d_pct} <span color=\"#5f78ff\">{time_icon_plain}</span> {7d_reset}'";
+const WAYBAR_FORMAT: &str = "<span font_family=\"bootstrap-icons\" rise=\"1200\" color=\"#5f78ff\">{icon_plain}</span> {5h_pct}% <span color=\"#5f78ff\">󰥔</span> {5h_reset} <span font_family=\"bootstrap-icons\" rise=\"1200\" color=\"#5f78ff\">{icon_plain}</span> {7d_pct} <span color=\"#5f78ff\">{time_icon_plain}</span> {7d_reset}";
+
+fn waybar_exec() -> String {
+    format!(
+        "{} --waybar --format '{}'",
+        shell_quote(&codex_switch_command()),
+        WAYBAR_FORMAT
+    )
+}
+
+fn codex_switch_command() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "codex-switch".to_string();
+    };
+    if path.file_name().and_then(|name| name.to_str()) == Some("codex-switch") {
+        return path.display().to_string();
+    }
+    "codex-switch".to_string()
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '+'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
 
 pub fn install_waybar_config() {
     let home = std::env::var("HOME").unwrap_or_else(|_| crate::data::die("HOME not set"));
@@ -71,7 +100,7 @@ fn ensure_common_module(input: &str) -> String {
     let module = format!(
         "  \"{}\": {{\n    \"exec\": {},\n    \"return-type\": \"json\",\n    \"on-click\": \"/usr/bin/pkill -RTMIN+11 waybar\",\n    \"signal\": 11,\n    \"interval\": 120\n  }}",
         CODEX_USAGE_MODULE,
-        json_string(WAYBAR_EXEC)
+        json_string(&waybar_exec())
     );
 
     if let Some(pos) = input.rfind('}') {
@@ -87,7 +116,7 @@ fn ensure_common_module(input: &str) -> String {
 }
 
 fn ensure_module_properties(block: &str) -> String {
-    let mut updated = set_or_insert_property(block, "exec", &json_string(WAYBAR_EXEC));
+    let mut updated = set_or_insert_property(block, "exec", &json_string(&waybar_exec()));
     updated = set_or_insert_property(&updated, "return-type", &json_string("json"));
     updated
 }
