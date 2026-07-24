@@ -10,5 +10,9 @@ pub fn show_storage(ctx: &Context) {
         ctx.codex_profiles_dir().display()
     );
     println!("  saved PI profiles: {}", ctx.pi_profiles_dir().display());
+    println!(
+        "  profile transfers: {}",
+        ctx.profile_transfers_path().display()
+    );
     println!("  account tracker: {}", ctx.tracker_file.display());
 }

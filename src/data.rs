@@ -25,13 +25,34 @@ pub struct Tokens {
 pub struct UsageResponse {
     #[serde(default)]
     pub plan_type: Option<String>,
-    pub rate_limit: UsageRateLimit,
+    #[serde(default)]
+    pub rate_limit: Option<UsageRateLimit>,
+    #[serde(default)]
+    pub spend_control: Option<SpendControl>,
+    #[serde(default)]
+    pub credits: Option<UsageCredits>,
+}
+
+impl UsageResponse {
+    pub fn five_hour_window(&self) -> Option<&UsageWindow> {
+        self.rate_limit.as_ref()?.five_hour_window()
+    }
+
+    pub fn weekly_window(&self) -> Option<&UsageWindow> {
+        self.rate_limit.as_ref()?.weekly_window()
+    }
+
+    pub fn monthly_limit(&self) -> Option<&MonthlyCreditLimit> {
+        self.spend_control.as_ref()?.individual_limit.as_ref()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UsageRateLimit {
-    pub primary_window: UsageWindow,
-    pub secondary_window: UsageWindow,
+    #[serde(default)]
+    pub primary_window: Option<UsageWindow>,
+    #[serde(default)]
+    pub secondary_window: Option<UsageWindow>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -40,6 +61,151 @@ pub struct UsageWindow {
     pub used_percent: Option<f64>,
     #[serde(default)]
     pub reset_at: Option<ResetAt>,
+    #[serde(default)]
+    pub limit_window_seconds: Option<u64>,
+}
+
+impl UsageRateLimit {
+    pub fn five_hour_window(&self) -> Option<&UsageWindow> {
+        self.windows()
+            .find(|window| {
+                window
+                    .limit_window_seconds
+                    .is_some_and(|seconds| seconds <= 21_600)
+            })
+            .or_else(|| {
+                self.secondary_window
+                    .as_ref()
+                    .and(self.primary_window.as_ref())
+            })
+    }
+
+    pub fn weekly_window(&self) -> Option<&UsageWindow> {
+        self.windows()
+            .find(|window| {
+                window
+                    .limit_window_seconds
+                    .is_some_and(|seconds| seconds >= 518_400)
+            })
+            .or(self.secondary_window.as_ref())
+            .or(self.primary_window.as_ref())
+    }
+
+    fn windows(&self) -> impl Iterator<Item = &UsageWindow> {
+        self.primary_window
+            .iter()
+            .chain(self.secondary_window.iter())
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::{CreditAmount, UsageResponse};
+
+    #[test]
+    fn identifies_weekly_only_primary_window() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":8,"limit_window_seconds":604800,"reset_at":1784487471},"secondary_window":null}}"#,
+        )
+        .unwrap();
+
+        assert!(usage.five_hour_window().is_none());
+        assert_eq!(usage.weekly_window().unwrap().used_percent, Some(8.0));
+    }
+
+    #[test]
+    fn supports_legacy_windows_without_durations() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":12,"reset_at":1784487471},"secondary_window":{"used_percent":34,"reset_at":1784487472}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(usage.five_hour_window().unwrap().used_percent, Some(12.0));
+        assert_eq!(usage.weekly_window().unwrap().used_percent, Some(34.0));
+    }
+
+    #[test]
+    fn supports_business_monthly_spend_controls_without_rate_limits() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{
+                "plan_type":"business",
+                "rate_limit":null,
+                "credits":{"balance":null,"has_credits":true,"unlimited":false,"overage_limit_reached":false},
+                "spend_control":{"reached":false,"individual_limit":{
+                    "limit":"12500","used":"94.48079252243042","remaining":"12405.51920747757",
+                    "used_percent":1,"remaining_percent":99,"reset_after_seconds":1308136,
+                    "reset_at":1785542400,"source":"group_based_spend_controls"
+                }}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(usage.five_hour_window().is_none());
+        assert!(usage.weekly_window().is_none());
+        let monthly = usage.monthly_limit().unwrap();
+        assert_eq!(monthly.limit.as_ref().unwrap().as_f64(), Some(12_500.0));
+        assert_eq!(monthly.used_percent, Some(1.0));
+        assert_eq!(monthly.remaining_percent, Some(99.0));
+        assert_eq!(usage.spend_control.as_ref().unwrap().reached, Some(false));
+        assert_eq!(usage.credits.as_ref().unwrap().has_credits, Some(true));
+        assert_eq!(CreditAmount::Number(12.5).as_f64(), Some(12.5));
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SpendControl {
+    #[serde(default)]
+    pub individual_limit: Option<MonthlyCreditLimit>,
+    #[serde(default)]
+    pub reached: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MonthlyCreditLimit {
+    #[serde(default)]
+    pub limit: Option<CreditAmount>,
+    #[serde(default)]
+    pub used: Option<CreditAmount>,
+    #[serde(default)]
+    pub remaining: Option<CreditAmount>,
+    #[serde(default)]
+    pub used_percent: Option<f64>,
+    #[serde(default)]
+    pub remaining_percent: Option<f64>,
+    #[serde(default)]
+    pub reset_after_seconds: Option<u64>,
+    #[serde(default)]
+    pub reset_at: Option<ResetAt>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CreditAmount {
+    Number(f64),
+    String(String),
+}
+
+impl CreditAmount {
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Number(value) => Some(*value),
+            Self::String(value) => value.parse().ok(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UsageCredits {
+    #[serde(default)]
+    pub balance: Option<CreditAmount>,
+    #[serde(default)]
+    pub has_credits: Option<bool>,
+    #[serde(default)]
+    pub unlimited: Option<bool>,
+    #[serde(default)]
+    pub overage_limit_reached: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -170,6 +336,11 @@ impl Context {
         self.state_dir.join("profiles").join("pi")
     }
 
+    /// Returns the persisted Codex-to-PI transfer mappings.
+    pub fn profile_transfers_path(&self) -> PathBuf {
+        self.state_dir.join("profile-transfers.json")
+    }
+
     /// Returns the path for a profile file, e.g. ~/.local/state/codex-switch/profiles/codex/auth.json.work
     pub fn profile_path(&self, name: &str) -> PathBuf {
         self.codex_profiles_dir()
@@ -201,7 +372,8 @@ pub fn read_pi_auth(path: &Path) -> Option<PiAuthFile> {
 
 #[cfg(test)]
 mod tests {
-    use super::JwtAudience;
+    use super::{die, read_pi_auth, Context, JwtAudience};
+    use std::process::Command;
 
     #[test]
     fn jwt_audience_finds_app_client_id() {
@@ -219,6 +391,49 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn context_uses_home_layout() {
+        let ctx = Context::new();
+        assert!(ctx.live_auth.ends_with(".codex/auth.json"));
+        assert!(ctx.pi_auth.ends_with(".pi/agent/auth.json"));
+        assert!(ctx.tracker_file.ends_with("codex-switch/accounts.json"));
+        assert!(ctx.profile_path("work").ends_with("codex/auth.json.work"));
+        assert!(ctx.pi_profile_path("work").ends_with("pi/auth.json.work"));
+    }
+
+    #[test]
+    fn die_helper() {
+        if std::env::var_os("CODEX_SWITCH_TEST_DIE").is_some() {
+            die("expected failure");
+        }
+    }
+
+    #[test]
+    fn die_prints_error_and_exits_unsuccessfully() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "data::tests::die_helper", "--nocapture"])
+            .env("CODEX_SWITCH_TEST_DIE", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("codex-switch: expected failure"));
+    }
+
+    #[test]
+    fn read_pi_auth_handles_missing_invalid_and_valid_files() {
+        let base = std::env::temp_dir().join(format!("codex-switch-data-{}", std::process::id()));
+        let path = base.join("auth.json");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(read_pi_auth(&path).is_none());
+
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_pi_auth(&path).is_none());
+        std::fs::write(&path, r#"{"openai-codex":null}"#).unwrap();
+        assert!(read_pi_auth(&path).is_some());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -228,6 +443,30 @@ pub struct AccountTracker {
     pub sessions: Vec<TrackedSession>,
     #[serde(default)]
     pub last_snapshot: Option<TrackedAuthSnapshot>,
+    #[serde(default)]
+    pub last_quota_hit: Option<TrackedQuotaHit>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct TrackedQuotaHit {
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub window: Option<String>,
+    #[serde(default)]
+    pub previous_used_percent: Option<f64>,
+    #[serde(default)]
+    pub used_percent: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -258,6 +497,30 @@ pub struct TrackedSession {
     pub last_seen_at: Option<String>,
     #[serde(default)]
     pub rate_limit: Option<TrackedRateLimit>,
+    #[serde(default)]
+    pub monthly_usage: Option<TrackedMonthlyUsage>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct TrackedMonthlyUsage {
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub limit: Option<f64>,
+    #[serde(default)]
+    pub used: Option<f64>,
+    #[serde(default)]
+    pub remaining: Option<f64>,
+    #[serde(default)]
+    pub used_percent: Option<f64>,
+    #[serde(default)]
+    pub remaining_percent: Option<f64>,
+    #[serde(default)]
+    pub resets_at: Option<u64>,
+    #[serde(default)]
+    pub reached: Option<bool>,
+    #[serde(default)]
+    pub plan_type: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]

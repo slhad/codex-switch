@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CODEX_USAGE_MODULE: &str = "custom/codex-usage";
-const WAYBAR_FORMAT: &str = "<span font_family=\"bootstrap-icons\" rise=\"1200\" color=\"#5f78ff\">{icon_plain}</span> {5h_pct}% <span color=\"#5f78ff\">󰥔</span> {5h_reset} <span font_family=\"bootstrap-icons\" rise=\"1200\" color=\"#5f78ff\">{icon_plain}</span> {7d_pct} <span color=\"#5f78ff\">{time_icon_plain}</span> {7d_reset}";
+const WAYBAR_FORMAT: &str = "{usage_block_pango}";
 
 fn waybar_exec() -> String {
     format!(

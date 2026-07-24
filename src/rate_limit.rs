@@ -1,6 +1,6 @@
 use crate::data::{
-    read_auth, read_pi_auth, AuthFile, Context, PiOpenAiCodexAuth, ResetAt, UsageResponse,
-    UsageWindow,
+    read_auth, read_pi_auth, AuthFile, Context, CreditAmount, PiOpenAiCodexAuth, ResetAt,
+    UsageResponse, UsageWindow,
 };
 use crate::jwt::decode_token_payload;
 use chrono::{DateTime, Days, Local, TimeZone, Utc};
@@ -330,21 +330,35 @@ pub fn format_duration_until(target_epoch: u64) -> String {
 }
 
 pub fn summarize_window(window: &UsageWindow) -> Option<(String, String, String)> {
-    let resets_at = parse_reset_at(window.reset_at.as_ref())?;
-    let used = window.used_percent;
+    let (reset_text, reset_at_formatted) = summarize_reset(window.reset_at.as_ref())?;
+    let used_str = window
+        .used_percent
+        .map(|value| format!("{}", value))
+        .unwrap_or_else(|| "?".to_string());
+
+    Some((used_str, reset_text, reset_at_formatted))
+}
+
+pub fn summarize_reset(reset_at: Option<&ResetAt>) -> Option<(String, String)> {
+    let resets_at = parse_reset_at(reset_at)?;
     let reset_text = format_duration_until(resets_at);
     let reset_at_formatted = Local
         .timestamp_opt(resets_at as i64, 0)
         .single()?
         .format("%Y-%m-%d %H:%M:%S %Z")
         .to_string();
+    Some((reset_text, reset_at_formatted))
+}
 
-    let used_str = match used {
-        Some(p) => format!("{}", p),
-        None => "?".to_string(),
+pub fn format_credit_amount(amount: Option<&CreditAmount>) -> String {
+    let Some(value) = amount.and_then(CreditAmount::as_f64) else {
+        return "?".to_string();
     };
-
-    Some((used_str, reset_text, reset_at_formatted))
+    let formatted = format!("{:.2}", value);
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 pub fn parse_reset_at(value: Option<&ResetAt>) -> Option<u64> {

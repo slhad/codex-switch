@@ -44,3 +44,29 @@ pub fn decode_token_payload(token: &str) -> Option<JwtPayload> {
 
     serde_json::from_str(payload_str).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_token_payload, extract_email_from_token};
+
+    #[test]
+    fn decodes_direct_and_profile_emails() {
+        assert_eq!(
+            extract_email_from_token("x.eyJlbWFpbCI6ImRpcmVjdEBleGFtcGxlLmNvbSJ9.x").as_deref(),
+            Some("direct@example.com")
+        );
+        assert_eq!(
+            extract_email_from_token("x.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJwcm9maWxlQGV4YW1wbGUuY29tIn19.x").as_deref(),
+            Some("profile@example.com")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_payloads_and_accepts_padding() {
+        assert!(decode_token_payload("missing-payload").is_none());
+        assert!(decode_token_payload("x._w.x").is_none());
+        assert!(decode_token_payload("x.bm90LWpzb24.x").is_none());
+        assert!(decode_token_payload("x.e30==.x").is_none());
+        assert!(decode_token_payload("x.e30=.x").is_some());
+    }
+}

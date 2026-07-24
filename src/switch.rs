@@ -1,6 +1,9 @@
 use crate::data::{read_auth, read_pi_auth, Context, PiAuthFile, PiOpenAiCodexAuth};
 use crate::jwt::{decode_token_payload, extract_email_from_token};
-use crate::profile::{detect_current_profile, list_pi_profiles, profile_name};
+use crate::profile::{
+    detect_current_profile, list_pi_profiles, load_profile_transfers, profile_name,
+    remember_codex_to_pi_transfer,
+};
 use crate::status::show_status;
 use std::fs;
 use std::path::Path;
@@ -199,6 +202,22 @@ fn existing_pi_profile_for_auth(ctx: &Context, entry: &PiOpenAiCodexAuth) -> Opt
     None
 }
 
+fn write_pi_profile_and_switch_live(ctx: &Context, target_name: &str, entry: &PiOpenAiCodexAuth) {
+    let target = ctx.pi_profile_path(target_name);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|e| {
+            crate::data::die(&format!(
+                "failed to create PI profiles directory {}: {}",
+                parent.display(),
+                e
+            ))
+        });
+    }
+    write_pi_openai_codex_profile(&target, entry);
+    write_live_pi_openai_codex(ctx, entry);
+    println!("Switched PI auth to transferred profile: {}", target_name);
+}
+
 fn save_pi_profile_if_present(ctx: &Context, name: &str) {
     if !ctx.pi_auth.exists() {
         return;
@@ -229,7 +248,124 @@ fn save_pi_profile_if_present(ctx: &Context, name: &str) {
     println!("Saved current PI auth into profile: {}", name);
 }
 
+fn validate_profile_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(
+            "profile NAME must contain only ASCII letters, numbers, `-`, or `_`".to_string(),
+        );
+    }
+    if name.starts_with("bak-") {
+        return Err("profile NAME must not start with `bak-`".to_string());
+    }
+    Ok(())
+}
+
+fn parse_profile_ref(reference: &str) -> Result<(&str, &str), String> {
+    let Some((store, name)) = reference.split_once('/') else {
+        return Err(format!(
+            "profile reference `{}` must use STORE/PROFILE syntax",
+            reference
+        ));
+    };
+    if name.contains('/') {
+        return Err(format!(
+            "profile reference `{}` must contain exactly one `/`",
+            reference
+        ));
+    }
+    if !matches!(store, "codex" | "pi") {
+        return Err(format!(
+            "profile reference store must be `codex` or `pi`, got `{}`",
+            store
+        ));
+    }
+    validate_profile_name(name)?;
+    Ok((store, name))
+}
+
+fn imported_profile_summary(
+    ctx: &Context,
+    name: &str,
+    target: &Path,
+    auth: &crate::data::AuthFile,
+) -> String {
+    let email = crate::jwt::extract_email(auth).unwrap_or_else(|| "?".to_string());
+    let account = auth.tokens.account_id.as_deref().unwrap_or("?");
+    let mode = auth.auth_mode.as_deref().unwrap_or("?");
+    let refresh = auth.last_refresh.as_deref().unwrap_or("?");
+    format!(
+        "Imported Codex profile: {name}\n  path: {}\n  email: {email}\n  account: {account}\n  auth mode: {mode}\n  last refresh: {refresh}\nLive auth was not changed: {}",
+        target.display(),
+        ctx.live_auth.display()
+    )
+}
+
+pub fn import_profile(ctx: &Context, name: &str, source: &Path, force: bool) {
+    validate_profile_name(name).unwrap_or_else(|e| crate::data::die(&e));
+
+    let metadata = fs::metadata(source).unwrap_or_else(|e| {
+        crate::data::die(&format!(
+            "failed to read import source {}: {}",
+            source.display(),
+            e
+        ))
+    });
+    if !metadata.is_file() {
+        crate::data::die(&format!(
+            "import source is not a regular file: {}",
+            source.display()
+        ));
+    }
+
+    let content = fs::read_to_string(source).unwrap_or_else(|e| {
+        crate::data::die(&format!(
+            "failed to read import source {}: {}",
+            source.display(),
+            e
+        ))
+    });
+    let auth: crate::data::AuthFile = serde_json::from_str(&content).unwrap_or_else(|e| {
+        crate::data::die(&format!(
+            "invalid Codex auth JSON {}: {}",
+            source.display(),
+            e
+        ))
+    });
+
+    let target = ctx.profile_path(name);
+    if target.exists() && !force {
+        crate::data::die(&format!(
+            "profile `{}` already exists; use --force to replace it",
+            name
+        ));
+    }
+    let parent = target
+        .parent()
+        .unwrap_or_else(|| crate::data::die("profile path has no parent directory"));
+    fs::create_dir_all(parent).unwrap_or_else(|e| {
+        crate::data::die(&format!(
+            "failed to create Codex profiles directory {}: {}",
+            parent.display(),
+            e
+        ))
+    });
+    let tmp = parent.join(format!(".auth.json.{}.tmp", name));
+    fs::write(&tmp, &content)
+        .unwrap_or_else(|e| crate::data::die(&format!("failed to write imported profile: {}", e)));
+    fs::rename(&tmp, &target).unwrap_or_else(|e| {
+        let _ = fs::remove_file(&tmp);
+        crate::data::die(&format!("failed to install imported profile: {}", e))
+    });
+
+    println!("{}", imported_profile_summary(ctx, name, &target, &auth));
+}
+
 pub fn save_profile(ctx: &Context, store: &str, name: &str) {
+    validate_profile_name(name).unwrap_or_else(|error| crate::data::die(&error));
     match store {
         "codex" => {
             if !ctx.live_auth.exists() {
@@ -257,13 +393,12 @@ pub fn save_profile(ctx: &Context, store: &str, name: &str) {
     show_status(ctx, false, false);
 }
 
-pub fn transfer_profile(
-    ctx: &Context,
-    source_store: &str,
-    source_name: &str,
-    target_store: &str,
-    target_name: &str,
-) {
+pub fn transfer_profile(ctx: &Context, source_ref: &str, target_ref: &str) {
+    let (source_store, source_name) =
+        parse_profile_ref(source_ref).unwrap_or_else(|error| crate::data::die(&error));
+    let (target_store, target_name) =
+        parse_profile_ref(target_ref).unwrap_or_else(|error| crate::data::die(&error));
+
     match (source_store, target_store) {
         ("codex", "codex") => {
             let source = ctx.profile_path(source_name);
@@ -300,17 +435,7 @@ pub fn transfer_profile(
                 ));
             }
             let entry = load_pi_openai_codex(&source);
-            let target = ctx.pi_profile_path(target_name);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).unwrap_or_else(|e| {
-                    crate::data::die(&format!(
-                        "failed to create PI profiles directory {}: {}",
-                        parent.display(),
-                        e
-                    ))
-                });
-            }
-            write_pi_openai_codex_profile(&target, &entry);
+            write_pi_profile_and_switch_live(ctx, target_name, &entry);
         }
         ("codex", "pi") => {
             let source = ctx.profile_path(source_name);
@@ -321,18 +446,13 @@ pub fn transfer_profile(
                 ));
             }
             let auth = read_auth(&source);
-            let target = ctx.pi_profile_path(target_name);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).unwrap_or_else(|e| {
-                    crate::data::die(&format!(
-                        "failed to create PI profiles directory {}: {}",
-                        parent.display(),
-                        e
-                    ))
-                });
-            }
             let entry = auth_to_pi_openai_codex(&auth);
-            write_pi_openai_codex_profile(&target, &entry);
+            write_pi_profile_and_switch_live(ctx, target_name, &entry);
+            remember_codex_to_pi_transfer(ctx, source_name, target_name);
+            println!(
+                "Remembered Codex-to-PI transfer for switches: {} -> {}",
+                source_name, target_name
+            );
         }
         ("pi", "codex") => {
             crate::data::die(
@@ -379,10 +499,20 @@ pub fn restore_last(ctx: &Context) {
 }
 
 pub fn switch_profile(ctx: &Context, target: &str, force: bool, scope: SwitchScope) {
+    validate_profile_name(target).unwrap_or_else(|error| crate::data::die(&error));
     let target_path = ctx.profile_path(target);
-    let target_pi_path = ctx.pi_profile_path(target);
+    let remembered_pi_target = (scope == SwitchScope::Both)
+        .then(|| load_profile_transfers(ctx).codex_to_pi.get(target).cloned())
+        .flatten();
+    if let Some(pi_target) = remembered_pi_target.as_deref() {
+        validate_profile_name(pi_target).unwrap_or_else(|error| crate::data::die(&error));
+    }
+    let pi_target_name = remembered_pi_target.as_deref().unwrap_or(target);
+    let target_pi_path = ctx.pi_profile_path(pi_target_name);
     let should_switch_codex = scope != SwitchScope::PiOnly && target_path.exists();
-    let should_switch_pi = scope != SwitchScope::CodexOnly && target_pi_path.exists();
+    let should_transfer_to_pi = remembered_pi_target.is_some() && should_switch_codex;
+    let should_switch_pi =
+        scope != SwitchScope::CodexOnly && (target_pi_path.exists() || should_transfer_to_pi);
 
     match scope {
         SwitchScope::Both => {
@@ -420,7 +550,7 @@ pub fn switch_profile(ctx: &Context, target: &str, force: bool, scope: SwitchSco
         let _ = read_auth(&target_path);
     }
 
-    if should_switch_pi {
+    if should_switch_pi && !should_transfer_to_pi {
         let _ = load_pi_openai_codex(&target_pi_path);
     }
 
@@ -463,8 +593,16 @@ pub fn switch_profile(ctx: &Context, target: &str, force: bool, scope: SwitchSco
         );
     }
 
-    if should_switch_pi {
-        switch_pi_profile_if_present(ctx, target);
+    if should_transfer_to_pi {
+        let auth = read_auth(&target_path);
+        let entry = auth_to_pi_openai_codex(&auth);
+        write_pi_profile_and_switch_live(ctx, pi_target_name, &entry);
+        println!(
+            "Reproduced remembered Codex-to-PI transfer: {} -> {}",
+            target, pi_target_name
+        );
+    } else if should_switch_pi {
+        switch_pi_profile_if_present(ctx, pi_target_name);
     } else if scope == SwitchScope::Both {
         println!(
             "No PI auth profile for target {}; left PI auth unchanged",
@@ -482,9 +620,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        load_pi_openai_codex, restore_last_snapshot, save_codex_profile, save_named_profile_state,
+        import_profile, imported_profile_summary, load_pi_openai_codex, parse_profile_ref,
+        restore_last_snapshot, save_codex_profile, save_named_profile_state,
         save_pi_profile_if_present, save_profile, switch_pi_profile_if_present, switch_profile,
-        transfer_profile, SwitchScope,
+        transfer_profile, validate_profile_name, SwitchScope,
     };
     use crate::data::{AccountTracker, Context, TrackedAuthSnapshot};
     use crate::tracker::save_tracker;
@@ -832,13 +971,194 @@ mod tests {
         )
         .unwrap();
 
-        transfer_profile(&ctx, "codex", "mate", "pi", "mate-pi");
+        transfer_profile(&ctx, "codex/mate", "pi/mate-pi");
 
         let saved_pi = load_pi_openai_codex(&ctx.pi_profile_path("mate-pi"));
         assert_eq!(saved_pi.account_id.as_deref(), Some("acct-mate"));
+        assert_eq!(
+            crate::profile::load_profile_transfers(&ctx)
+                .codex_to_pi
+                .get("mate")
+                .map(String::as_str),
+            Some("mate-pi")
+        );
         assert_eq!(saved_pi.refresh.as_deref(), Some("refresh-token"));
         assert_eq!(saved_pi.expires, Some(1_782_084_674_000));
 
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn normal_switch_reproduces_only_the_remembered_codex_to_pi_transfer() {
+        let (ctx, base) = test_context("switch-remembered-transfer");
+        std::fs::create_dir_all(ctx.profile_path("me").parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ctx.pi_auth.parent().unwrap()).unwrap();
+        let me = r#"{"tokens":{"id_token":"me","account_id":"acct-me"}}"#;
+        let mate = r#"{"tokens":{"id_token":"mate","access_token":"e30.eyJleHAiOjE3ODIwODQ2NzR9.sig","refresh_token":"mate-refresh","account_id":"acct-mate"}}"#;
+        std::fs::write(&ctx.live_auth, me).unwrap();
+        std::fs::write(ctx.profile_path("me"), me).unwrap();
+        std::fs::write(ctx.profile_path("mate"), mate).unwrap();
+        std::fs::write(
+            &ctx.pi_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"pi-me","accountId":"acct-me"}}"#,
+        )
+        .unwrap();
+        crate::profile::remember_codex_to_pi_transfer(&ctx, "mate", "mate");
+
+        switch_profile(&ctx, "mate", false, SwitchScope::Both);
+
+        let live_pi = load_pi_openai_codex(&ctx.pi_auth);
+        assert_eq!(live_pi.account_id.as_deref(), Some("acct-mate"));
+        assert_eq!(live_pi.refresh.as_deref(), Some("mate-refresh"));
+        assert!(ctx.pi_profile_path("mate").exists());
+        let saved_me = load_pi_openai_codex(&ctx.pi_profile_path("me"));
+        assert_eq!(saved_me.access, "pi-me");
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn transfer_profile_switches_live_pi_to_transferred_target() {
+        let (ctx, base) = test_context("transfer-codex-switches-pi");
+        std::fs::create_dir_all(ctx.profile_path("mate").parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ctx.pi_profile_path("mate").parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ctx.pi_auth.parent().unwrap()).unwrap();
+        std::fs::write(
+            &ctx.live_auth,
+            r#"{"tokens":{"id_token":"e30.e30.sig","account_id":"acct-live"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.profile_path("mate"),
+            r#"{"tokens":{"id_token":"e30.e30.sig","access_token":"e30.eyJleHAiOjE3ODIwODQ2NzR9.sig","refresh_token":"new-refresh","account_id":"acct-mate"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.pi_profile_path("mate"),
+            r#"{"openai-codex":{"type":"oauth","access":"old-access","refresh":"old-refresh","accountId":"acct-mate"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &ctx.pi_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"old-access","refresh":"old-refresh","accountId":"acct-mate"}}"#,
+        )
+        .unwrap();
+
+        transfer_profile(&ctx, "codex/mate", "pi/mate");
+
+        let live_pi = load_pi_openai_codex(&ctx.pi_auth);
+        assert_eq!(live_pi.access, "e30.eyJleHAiOjE3ODIwODQ2NzR9.sig");
+        assert_eq!(live_pi.refresh.as_deref(), Some("new-refresh"));
+        assert_eq!(live_pi.expires, Some(1_782_084_674_000));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn transfer_profile_switches_live_pi_from_previous_profile() {
+        let (ctx, base) = test_context("transfer-codex-switches-from-previous-pi");
+        std::fs::create_dir_all(ctx.profile_path("mate").parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ctx.pi_profile_path("me").parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ctx.pi_auth.parent().unwrap()).unwrap();
+        std::fs::write(
+            &ctx.live_auth,
+            r#"{"tokens":{"id_token":"e30.e30.sig","account_id":"acct-live"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.profile_path("mate"),
+            r#"{"tokens":{"id_token":"e30.e30.sig","access_token":"e30.eyJleHAiOjE3ODIwODQ2NzR9.sig","refresh_token":"new-refresh","account_id":"acct-mate"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ctx.pi_profile_path("me"),
+            r#"{"openai-codex":{"type":"oauth","access":"live-access","refresh":"live-refresh","accountId":"acct-me"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &ctx.pi_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"live-access","refresh":"live-refresh","accountId":"acct-me"}}"#,
+        )
+        .unwrap();
+
+        transfer_profile(&ctx, "codex/mate", "pi/mate");
+
+        let live_pi = load_pi_openai_codex(&ctx.pi_auth);
+        assert_eq!(live_pi.access, "e30.eyJleHAiOjE3ODIwODQ2NzR9.sig");
+        assert_eq!(live_pi.refresh.as_deref(), Some("new-refresh"));
+        assert_eq!(live_pi.expires, Some(1_782_084_674_000));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn imports_codex_auth_without_changing_live_auth_and_can_force_replace() {
+        let (ctx, base) = test_context("import-profile");
+        let source = base.join("incoming-auth.json");
+        let live = r#"{"tokens":{"id_token":"live","account_id":"acct-live"}}"#;
+        let first = r#"{"tokens":{"id_token":"x.eyJlbWFpbCI6ImltcG9ydGVkQGV4YW1wbGUuY29tIn0.x","account_id":"acct-imported"},"auth_mode":"chatgpt","last_refresh":"2026-01-02T03:04:05Z"}"#;
+        std::fs::write(&ctx.live_auth, live).unwrap();
+        std::fs::write(&source, first).unwrap();
+
+        import_profile(&ctx, "work", &source, false);
+
+        assert_eq!(std::fs::read_to_string(&ctx.live_auth).unwrap(), live);
+        assert_eq!(
+            std::fs::read_to_string(ctx.profile_path("work")).unwrap(),
+            first
+        );
+
+        let replacement = r#"{"tokens":{"id_token":"replacement","account_id":"acct-new"}}"#;
+        std::fs::write(&source, replacement).unwrap();
+        import_profile(&ctx, "work", &source, true);
+        assert_eq!(
+            std::fs::read_to_string(ctx.profile_path("work")).unwrap(),
+            replacement
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn validates_import_names_and_formats_imported_auth_information() {
+        for valid in ["work", "Work2", "work-2", "team_one", "_private", "-alias"] {
+            assert!(validate_profile_name(valid).is_ok());
+        }
+        for invalid in [
+            "",
+            "../work",
+            ".hidden",
+            "team.one",
+            "bak-old",
+            "work/name",
+            "work name",
+            "café",
+        ] {
+            assert!(
+                validate_profile_name(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+
+        assert_eq!(parse_profile_ref("codex/mate"), Ok(("codex", "mate")));
+        for invalid_ref in ["mate", "codex/mate/extra", "other/mate", "pi/team.one"] {
+            assert!(
+                parse_profile_ref(invalid_ref).is_err(),
+                "accepted {invalid_ref}"
+            );
+        }
+
+        let (ctx, base) = test_context("import-summary");
+        let auth: crate::data::AuthFile = serde_json::from_str(
+            r#"{"tokens":{"id_token":"x.eyJlbWFpbCI6ImltcG9ydGVkQGV4YW1wbGUuY29tIn0.x","account_id":"acct-imported"},"auth_mode":"chatgpt","last_refresh":"2026-01-02T03:04:05Z"}"#,
+        )
+        .unwrap();
+        let summary = imported_profile_summary(&ctx, "work", &ctx.profile_path("work"), &auth);
+        assert!(summary.contains("Imported Codex profile: work"));
+        assert!(summary.contains("email: imported@example.com"));
+        assert!(summary.contains("account: acct-imported"));
+        assert!(summary.contains("auth mode: chatgpt"));
+        assert!(summary.contains("last refresh: 2026-01-02T03:04:05Z"));
+        assert!(summary.contains("Live auth was not changed"));
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -857,7 +1177,7 @@ mod tests {
         )
         .unwrap();
 
-        transfer_profile(&ctx, "pi", "me", "pi", "clone");
+        transfer_profile(&ctx, "pi/me", "pi/clone");
 
         let saved_pi = load_pi_openai_codex(&ctx.pi_profile_path("clone"));
         assert_eq!(saved_pi.access, "pi-access");

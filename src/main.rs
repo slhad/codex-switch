@@ -39,7 +39,13 @@ fn main() {
     }
 
     if cli.waybar {
-        waybar::print_waybar(&ctx, cli.format.as_deref(), cli.tooltip_format.as_deref());
+        waybar::print_waybar(
+            &ctx,
+            cli.format.as_deref(),
+            cli.tooltip_format.as_deref(),
+            cli.waybar_hide_minutes_with_days,
+            cli.waybar_hide_hours_with_days,
+        );
         return;
     }
 
@@ -54,12 +60,23 @@ fn main() {
     }
 
     if let Some(args) = cli.transfer_profile.as_ref() {
-        switch::transfer_profile(&ctx, &args[0], &args[1], &args[2], &args[3]);
+        switch::transfer_profile(&ctx, &args[0], &args[1]);
+        return;
+    }
+
+    if let Some(args) = cli.import_profile.as_ref() {
+        switch::import_profile(&ctx, &args[0], std::path::Path::new(&args[1]), cli.force);
+        return;
+    }
+
+    if cli.stop_remote {
+        process::stop_codex_remote(&ctx).unwrap_or_else(|error| data::die(&error));
         return;
     }
 
     if cli.kill {
         process::kill_codex_desktop(&ctx);
+        process::stop_codex_remote(&ctx).unwrap_or_else(|error| data::die(&error));
         if cli.profile.is_none() {
             return;
         }

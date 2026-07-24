@@ -1,6 +1,9 @@
 use chrono::Utc;
 
-use crate::data::{AccountTracker, Context, TrackedAuthSnapshot, TrackedRateLimit, TrackedSession};
+use crate::data::{
+    AccountTracker, Context, TrackedAuthSnapshot, TrackedMonthlyUsage, TrackedRateLimit,
+    TrackedSession,
+};
 
 fn normalize_tracker(mut tracker: AccountTracker) -> AccountTracker {
     tracker
@@ -151,6 +154,34 @@ pub fn update_rate_limit(
         secondary_resets_at,
         plan_type,
     });
+    entry.monthly_usage = None;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_monthly_usage(
+    entry: &mut TrackedSession,
+    observed_at: Option<String>,
+    limit: Option<f64>,
+    used: Option<f64>,
+    remaining: Option<f64>,
+    used_percent: Option<f64>,
+    remaining_percent: Option<f64>,
+    resets_at: Option<u64>,
+    reached: Option<bool>,
+    plan_type: Option<String>,
+) {
+    entry.monthly_usage = Some(TrackedMonthlyUsage {
+        observed_at,
+        limit,
+        used,
+        remaining,
+        used_percent,
+        remaining_percent,
+        resets_at,
+        reached,
+        plan_type,
+    });
+    entry.rate_limit = None;
 }
 
 #[cfg(test)]
@@ -160,7 +191,7 @@ mod tests {
 
     use super::{
         fingerprint_secret, load_last_snapshot, load_tracker, save_tracker, snapshot_live_auth,
-        upsert_session,
+        update_monthly_usage, update_rate_limit, upsert_session,
     };
     use crate::data::{AccountTracker, Context, TrackedAuthSnapshot};
 
@@ -233,6 +264,8 @@ mod tests {
         let fingerprint = fingerprint_secret(Some("rt.example.refresh")).unwrap();
         assert_eq!(fingerprint.len(), 16);
         assert_ne!(fingerprint, "rt.example.refresh");
+        assert_eq!(fingerprint_secret(None), None);
+        assert_eq!(fingerprint_secret(Some("")), None);
     }
 
     #[test]
@@ -273,5 +306,76 @@ mod tests {
             tracker.sessions[0].refresh_fingerprint.as_deref(),
             Some("efgh")
         );
+    }
+
+    #[test]
+    fn tracker_normalizes_invalid_and_empty_sessions() {
+        let (ctx, base) = test_context("tracker-normalize");
+        assert!(load_tracker(&ctx).sessions.is_empty());
+        std::fs::create_dir_all(&ctx.state_dir).unwrap();
+        std::fs::write(&ctx.tracker_file, "invalid").unwrap();
+        assert!(load_tracker(&ctx).sessions.is_empty());
+        std::fs::write(
+            &ctx.tracker_file,
+            r#"{"sessions":[{"session_id":""},{"session_id":"kept"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(load_tracker(&ctx).sessions.len(), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn upsert_preserves_optional_fields_and_updates_rate_limit() {
+        let mut tracker = AccountTracker::default();
+        let entry = upsert_session(
+            &mut tracker,
+            "pi:live",
+            None,
+            None,
+            "acct",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        update_rate_limit(entry, None, Some(9.0), 123, Some(22.0), Some(456), None);
+        let rate = tracker.sessions[0].rate_limit.as_ref().unwrap();
+        assert_eq!(rate.used_percent, Some(9.0));
+        assert_eq!(rate.secondary_resets_at, Some(456));
+
+        update_monthly_usage(
+            &mut tracker.sessions[0],
+            Some("2026-01-01T00:00:00Z".to_string()),
+            Some(100.0),
+            Some(25.0),
+            Some(75.0),
+            Some(25.0),
+            Some(75.0),
+            Some(123),
+            Some(false),
+            Some("business".to_string()),
+        );
+        let monthly = tracker.sessions[0].monthly_usage.as_ref().unwrap();
+        assert_eq!(monthly.remaining, Some(75.0));
+        assert!(tracker.sessions[0].rate_limit.is_none());
+    }
+
+    #[test]
+    fn save_tracker_tolerates_unwritable_paths() {
+        let (blocked_dir_ctx, blocked_dir_base) = test_context("tracker-blocked-dir");
+        std::fs::create_dir_all(blocked_dir_ctx.state_dir.parent().unwrap()).unwrap();
+        std::fs::write(&blocked_dir_ctx.state_dir, "not a directory").unwrap();
+        save_tracker(&blocked_dir_ctx, &AccountTracker::default());
+        assert!(!blocked_dir_ctx.tracker_file.exists());
+        std::fs::remove_dir_all(blocked_dir_base).unwrap();
+
+        let (blocked_tmp_ctx, blocked_tmp_base) = test_context("tracker-blocked-tmp");
+        std::fs::create_dir_all(blocked_tmp_ctx.state_dir.join("accounts.json.tmp")).unwrap();
+        save_tracker(&blocked_tmp_ctx, &AccountTracker::default());
+        assert!(!blocked_tmp_ctx.tracker_file.exists());
+        std::fs::remove_dir_all(blocked_tmp_base).unwrap();
     }
 }

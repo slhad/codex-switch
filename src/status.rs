@@ -1,12 +1,16 @@
 use crate::data::{read_auth, read_pi_auth, Context, PiOpenAiCodexAuth};
 use crate::jwt::{decode_token_payload, extract_email, extract_email_from_token};
-use crate::profile::{detect_current_profile, list_pi_profiles, list_profiles, profile_name};
+use crate::profile::{
+    detect_current_profile, list_pi_profiles, list_profiles, load_profile_transfers, profile_name,
+};
 use crate::rate_limit::{
     fetch_pi_rate_limit, fetch_pi_rate_limit_for_path, fetch_rate_limit,
-    fetch_rate_limit_for_auth_path, parse_reset_at, summarize_window,
+    fetch_rate_limit_for_auth_path, format_credit_amount, parse_reset_at, summarize_reset,
+    summarize_window,
 };
 use crate::tracker::{
-    fingerprint_secret, load_tracker, save_tracker, update_rate_limit, upsert_session,
+    fingerprint_secret, load_tracker, save_tracker, update_monthly_usage, update_rate_limit,
+    upsert_session,
 };
 use chrono::{Local, TimeZone};
 
@@ -45,15 +49,36 @@ fn update_entry_rate_limit_from_usage(
     entry: &mut crate::data::TrackedSession,
     usage: &crate::data::UsageResponse,
 ) {
-    if let Some(resets_at) = parse_reset_at(usage.rate_limit.primary_window.reset_at.as_ref()) {
+    if let Some(monthly) = usage.monthly_limit() {
+        update_monthly_usage(
+            entry,
+            Some(chrono::Utc::now().to_rfc3339()),
+            monthly.limit.as_ref().and_then(|value| value.as_f64()),
+            monthly.used.as_ref().and_then(|value| value.as_f64()),
+            monthly.remaining.as_ref().and_then(|value| value.as_f64()),
+            monthly.used_percent,
+            monthly.remaining_percent,
+            parse_reset_at(monthly.reset_at.as_ref()),
+            usage.spend_control.as_ref().and_then(|value| value.reached),
+            usage.plan_type.clone(),
+        );
+        return;
+    }
+
+    let primary = usage.five_hour_window();
+    let secondary = usage.weekly_window();
+    if primary.is_some() || secondary.is_some() {
+        let resets_at = primary
+            .and_then(|window| parse_reset_at(window.reset_at.as_ref()))
+            .unwrap_or(0);
         let secondary_resets_at =
-            parse_reset_at(usage.rate_limit.secondary_window.reset_at.as_ref());
+            secondary.and_then(|window| parse_reset_at(window.reset_at.as_ref()));
         update_rate_limit(
             entry,
             Some(chrono::Utc::now().to_rfc3339()),
-            usage.rate_limit.primary_window.used_percent,
+            primary.and_then(|window| window.used_percent),
             resets_at,
-            usage.rate_limit.secondary_window.used_percent,
+            secondary.and_then(|window| window.used_percent),
             secondary_resets_at,
             usage.plan_type.clone(),
         );
@@ -76,6 +101,39 @@ fn tracked_session_display_name(entry: &crate::data::TrackedSession) -> String {
         .or(entry.email.as_deref().filter(|email| !email.is_empty()))
         .map(str::to_string)
         .unwrap_or_else(|| short_id(Some(entry.account_id.as_str())))
+}
+
+fn format_percentage(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{}", value))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn print_monthly_usage(usage: &crate::data::UsageResponse) {
+    let Some(monthly) = usage.monthly_limit() else {
+        return;
+    };
+
+    println!(
+        "  monthly used: {} / {} credits ({}%)",
+        format_credit_amount(monthly.used.as_ref()),
+        format_credit_amount(monthly.limit.as_ref()),
+        format_percentage(monthly.used_percent)
+    );
+    println!(
+        "  monthly remaining: {} credits ({}%)",
+        format_credit_amount(monthly.remaining.as_ref()),
+        format_percentage(monthly.remaining_percent)
+    );
+    if let Some((reset_in, reset_at)) = summarize_reset(monthly.reset_at.as_ref()) {
+        println!("  monthly reset: in {} ({})", reset_in, reset_at);
+    }
+    if let Some(reached) = usage.spend_control.as_ref().and_then(|value| value.reached) {
+        println!(
+            "  monthly limit reached: {}",
+            if reached { "yes" } else { "no" }
+        );
+    }
 }
 
 pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
@@ -142,17 +200,17 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
     }
 
     if let Some(Ok(usage)) = &latest_rate_limit {
-        if let Some((used, reset_in, reset_at)) = summarize_window(&usage.rate_limit.primary_window)
+        if let Some((used, reset_in, reset_at)) =
+            usage.five_hour_window().and_then(summarize_window)
         {
             println!("  5h used: {}%", used);
             println!("  5h reset: in {} ({})", reset_in, reset_at);
         }
-        if let Some((used, reset_in, reset_at)) =
-            summarize_window(&usage.rate_limit.secondary_window)
-        {
+        if let Some((used, reset_in, reset_at)) = usage.weekly_window().and_then(summarize_window) {
             println!("  7d used: {}%", used);
             println!("  7d reset: in {} ({})", reset_in, reset_at);
         }
+        print_monthly_usage(usage);
     } else if let Some(entry) =
         live.as_ref()
             .and_then(|auth| auth.tokens.account_id.as_deref())
@@ -202,6 +260,7 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
     println!("Saved Codex profiles:");
 
     let profiles = list_profiles(ctx);
+    let profile_transfers = load_profile_transfers(ctx);
     for p in &profiles {
         let name = profile_name(p);
         let marker = if current_profile.as_deref() == Some(&name) {
@@ -246,16 +305,21 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
         }
 
         let is_live = if is_live_profile { " [live]" } else { "" };
+        let transfer = profile_transfers
+            .codex_to_pi
+            .get(&name)
+            .map(|target| format!(" [transfer→pi:{}]", target))
+            .unwrap_or_default();
 
         if let Some(email) = email_column_for_profile(&name, &email) {
             println!(
-                "{} {:>8} {}  {}  {}  {}{}",
-                marker, name, email, account, mode, refresh, is_live
+                "{} {:>8} {}  {}  {}  {}{}{}",
+                marker, name, email, account, mode, refresh, is_live, transfer
             );
         } else {
             println!(
-                "{} {:>8} {}  {}  {}{}",
-                marker, name, account, mode, refresh, is_live
+                "{} {:>8} {}  {}  {}{}{}",
+                marker, name, account, mode, refresh, is_live, transfer
             );
         }
     }
@@ -451,17 +515,18 @@ fn show_pi_status(
                 usage.plan_type.as_deref().unwrap_or("?")
             );
             if let Some((used, reset_in, reset_at)) =
-                summarize_window(&usage.rate_limit.primary_window)
+                usage.five_hour_window().and_then(summarize_window)
             {
                 println!("  5h used: {}%", used);
                 println!("  5h reset: in {} ({})", reset_in, reset_at);
             }
             if let Some((used, reset_in, reset_at)) =
-                summarize_window(&usage.rate_limit.secondary_window)
+                usage.weekly_window().and_then(summarize_window)
             {
                 println!("  7d used: {}%", used);
                 println!("  7d reset: in {} ({})", reset_in, reset_at);
             }
+            print_monthly_usage(usage);
         }
         Err(err) => println!("  usage: unavailable ({})", err),
     }
@@ -590,33 +655,55 @@ fn show_tracked_sessions(tracker: &crate::data::AccountTracker, current_session_
         let access_expires = format_epoch_ms(entry.access_expires_at);
         print!("  expires:{}", access_expires);
 
-        let used_5h = entry
-            .rate_limit
-            .as_ref()
-            .and_then(|rate_limit| rate_limit.used_percent)
-            .map(|value| format!("{}%", value))
-            .unwrap_or_else(|| "?%".to_string());
-        let reset_5h = entry
-            .rate_limit
-            .as_ref()
-            .map(|rate_limit| crate::rate_limit::format_duration_until(rate_limit.resets_at))
-            .unwrap_or_else(|| "?".to_string());
-        let used_7d = entry
-            .rate_limit
-            .as_ref()
-            .and_then(|rate_limit| rate_limit.secondary_used_percent)
-            .map(|value| format!("{}%", value))
-            .unwrap_or_else(|| "?%".to_string());
-        let reset_7d = entry
-            .rate_limit
-            .as_ref()
-            .and_then(|rate_limit| rate_limit.secondary_resets_at)
-            .map(crate::rate_limit::format_duration_until)
-            .unwrap_or_else(|| "?".to_string());
-        print!(
-            "  5h:{} reset:{}  7d:{} reset:{}",
-            used_5h, reset_5h, used_7d, reset_7d
-        );
+        if let Some(monthly) = entry.monthly_usage.as_ref() {
+            let used = monthly
+                .used
+                .map(|value| format!("{:.2}", value))
+                .unwrap_or_else(|| "?".to_string());
+            let remaining = monthly
+                .remaining
+                .map(|value| format!("{:.2}", value))
+                .unwrap_or_else(|| "?".to_string());
+            let reset = monthly
+                .resets_at
+                .map(crate::rate_limit::format_duration_until)
+                .unwrap_or_else(|| "?".to_string());
+            print!(
+                "  month:{}% used:{} remaining:{} reset:{}",
+                format_percentage(monthly.used_percent),
+                used,
+                remaining,
+                reset
+            );
+        } else {
+            let used_5h = entry
+                .rate_limit
+                .as_ref()
+                .and_then(|rate_limit| rate_limit.used_percent)
+                .map(|value| format!("{}%", value))
+                .unwrap_or_else(|| "?%".to_string());
+            let reset_5h = entry
+                .rate_limit
+                .as_ref()
+                .map(|rate_limit| crate::rate_limit::format_duration_until(rate_limit.resets_at))
+                .unwrap_or_else(|| "?".to_string());
+            let used_7d = entry
+                .rate_limit
+                .as_ref()
+                .and_then(|rate_limit| rate_limit.secondary_used_percent)
+                .map(|value| format!("{}%", value))
+                .unwrap_or_else(|| "?%".to_string());
+            let reset_7d = entry
+                .rate_limit
+                .as_ref()
+                .and_then(|rate_limit| rate_limit.secondary_resets_at)
+                .map(crate::rate_limit::format_duration_until)
+                .unwrap_or_else(|| "?".to_string());
+            print!(
+                "  5h:{} reset:{}  7d:{} reset:{}",
+                used_5h, reset_5h, used_7d, reset_7d
+            );
+        }
 
         println!();
     }
