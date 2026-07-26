@@ -251,9 +251,64 @@ pub fn logs(follow: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        install_files, installation_lines, logs_command, service_content, timer_content,
-        user_systemd_dir, validate_timer_value,
+        install_files, installation_lines, logs_command, quote_systemd, run, service_content,
+        timer_content, timer_value_from_env, user_systemd_dir, validate_timer_value,
     };
+
+    #[test]
+    fn quotes_systemd_paths_and_runs_commands() {
+        assert_eq!(
+            quote_systemd(std::path::Path::new(r#"/tmp/a%/b\"c"#)),
+            "\"/tmp/a%%/b\\\\\\\"c\""
+        );
+        assert!(run(&mut std::process::Command::new("true"), "succeed", false).is_ok());
+        assert!(run(&mut std::process::Command::new("false"), "fail", true).is_ok());
+        assert!(run(&mut std::process::Command::new("false"), "fail", false).is_err());
+        assert!(run(
+            &mut std::process::Command::new("codex-switch-command-that-does-not-exist"),
+            "spawn",
+            false,
+        )
+        .unwrap_err()
+        .contains("failed to spawn"));
+    }
+
+    #[test]
+    fn reads_timer_values_from_environment() {
+        let name = "CODEX_SWITCH_TEST_TIMER_VALUE";
+        std::env::remove_var(name);
+        assert_eq!(timer_value_from_env(name, "5min").unwrap(), "5min");
+        std::env::set_var(name, " 30s ");
+        assert_eq!(timer_value_from_env(name, "5min").unwrap(), "30s");
+        std::env::set_var(name, "bad-value");
+        assert!(timer_value_from_env(name, "5min").is_err());
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn reports_partial_and_unreadable_installations() {
+        let base = std::env::temp_dir().join(format!(
+            "codex-switch-systemd-partial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let unit_dir = user_systemd_dir(&base);
+        std::fs::create_dir_all(&unit_dir).unwrap();
+
+        std::fs::write(unit_dir.join("codex-switch.service"), "[Service]\n").unwrap();
+        let lines = installation_lines(&base).unwrap().unwrap();
+        assert!(lines.iter().any(|line| line.contains("timer: missing")));
+
+        std::fs::remove_file(unit_dir.join("codex-switch.service")).unwrap();
+        std::fs::write(unit_dir.join("codex-switch.timer"), "[Timer]\n").unwrap();
+        let lines = installation_lines(&base).unwrap().unwrap();
+        assert!(lines.iter().any(|line| line.contains("service: missing")));
+
+        std::fs::remove_file(unit_dir.join("codex-switch.timer")).unwrap();
+        std::fs::create_dir(unit_dir.join("codex-switch.service")).unwrap();
+        assert!(installation_lines(&base).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn service_runs_requested_binary_with_inline_threshold_environment() {

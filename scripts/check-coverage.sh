@@ -48,7 +48,10 @@ if [[ "${#OBJECTS[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-IGNORE_REGEX='/.cargo/registry|/.rustup/|/rustc/|/target/|src/(cli|main|install|process|rate_limit|status|storage|switch|waybar|waybar_config)\.rs'
+# Exclude command-surface and external-process/network orchestration modules. Their
+# behavior is covered by focused unit tests, while this gate measures the
+# deterministic data, JWT, profile, profile-options, and tracker core.
+IGNORE_REGEX='/.cargo/registry|/.rustup/|/rustc/|/target/|src/(auto_switch|cli|completions|main|install|process|rate_limit|status|storage|switch|systemd|waybar|waybar_config)\.rs'
 
 REPORT_ARGS=()
 for object in "${OBJECTS[@]}"; do

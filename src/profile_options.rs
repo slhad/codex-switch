@@ -233,8 +233,9 @@ pub fn transfer_target(ctx: &Context, name: &str) -> Result<Option<String>, Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_transfer, load, load_read_only, set_transfer_enabled, transfer_target,
-        update_auto, AutoSwitchPolicy, TransferOnSwitchPolicy,
+        configure_transfer, load, load_read_only, remove_auto, save, set_transfer_enabled,
+        transfer_target, update_auto, AutoSwitchPolicy, ProfileOption, ProfileOptions,
+        TransferOnSwitchPolicy,
     };
     use crate::data::Context;
 
@@ -330,6 +331,99 @@ mod tests {
         assert!(transfer_target(&ctx, "work").unwrap().is_none());
         assert_eq!(set_transfer_enabled(&ctx, "work", true).unwrap(), "work-pi");
         assert!(set_transfer_enabled(&ctx, "missing", true).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn loads_existing_options_and_reports_invalid_files() {
+        let (ctx, base) = context("load-existing");
+        std::fs::create_dir_all(&ctx.state_dir).unwrap();
+        std::fs::write(
+            ctx.profile_options_path(),
+            r#"{"profiles":{"work":{"auto":{"priority":7}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load(&ctx).unwrap().profiles["work"]
+                .auto
+                .as_ref()
+                .unwrap()
+                .priority,
+            7
+        );
+
+        std::fs::write(ctx.profile_options_path(), "invalid").unwrap();
+        assert!(load(&ctx).unwrap_err().contains("invalid profile options"));
+        std::fs::remove_file(ctx.profile_options_path()).unwrap();
+        std::fs::create_dir(ctx.profile_options_path()).unwrap();
+        assert!(load(&ctx).unwrap_err().contains("failed to read"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn save_reports_directory_and_output_path_errors() {
+        let (ctx, base) = context("save-errors");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&ctx.state_dir, "not a directory").unwrap();
+        assert!(save(&ctx, &ProfileOptions::default())
+            .unwrap_err()
+            .contains("failed to create state directory"));
+        std::fs::remove_file(&ctx.state_dir).unwrap();
+        std::fs::create_dir_all(ctx.profile_options_path()).unwrap();
+        assert!(save(&ctx, &ProfileOptions::default())
+            .unwrap_err()
+            .contains("failed to save profile options"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn updates_and_removes_auto_policy_without_losing_transfer() {
+        let (ctx, base) = context("remove-auto");
+        let policy =
+            update_auto(&ctx, "work", Some(false), Some(42), Some(false), Some(true)).unwrap();
+        assert_eq!(
+            policy,
+            AutoSwitchPolicy {
+                enabled: false,
+                priority: 42,
+                codex: false,
+                pi: true,
+            }
+        );
+        configure_transfer(&ctx, "work", "work-pi").unwrap();
+        assert!(remove_auto(&ctx, "work").unwrap());
+        assert!(!remove_auto(&ctx, "work").unwrap());
+        assert!(load(&ctx).unwrap().profiles["work"].auto.is_none());
+        assert!(load(&ctx).unwrap().profiles["work"].transfer.is_some());
+
+        update_auto(&ctx, "auto-only", None, None, None, None).unwrap();
+        assert!(remove_auto(&ctx, "auto-only").unwrap());
+        assert!(!load(&ctx).unwrap().profiles.contains_key("auto-only"));
+        assert!(remove_auto(&ctx, "bad/name").is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn transfer_operations_validate_names_and_missing_targets() {
+        let (ctx, base) = context("transfer-validation");
+        assert!(configure_transfer(&ctx, "bad/name", "work").is_err());
+        assert!(configure_transfer(&ctx, "work", "bad/name").is_err());
+        assert!(set_transfer_enabled(&ctx, "bad/name", true).is_err());
+        assert!(transfer_target(&ctx, "missing").unwrap().is_none());
+
+        let mut options = ProfileOptions::default();
+        options.profiles.insert(
+            "disabled".to_string(),
+            ProfileOption {
+                auto: None,
+                transfer: Some(TransferOnSwitchPolicy {
+                    enabled: false,
+                    pi_profile: "target".to_string(),
+                }),
+            },
+        );
+        save(&ctx, &options).unwrap();
+        assert!(transfer_target(&ctx, "disabled").unwrap().is_none());
         std::fs::remove_dir_all(base).unwrap();
     }
 

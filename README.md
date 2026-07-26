@@ -58,6 +58,7 @@ codex-switch waybar print [--format FORMAT] [--tooltip-format FORMAT]
     [--waybar-hide-hours-with-days BOOL]
 codex-switch waybar install
 
+codex-switch tracker list
 codex-switch tracker remove SESSION_ID
 codex-switch storage
 codex-switch recovery restore
@@ -66,7 +67,7 @@ codex-switch completion bash
 codex-switch completion install [--force]
 ```
 
-`STORE` is `codex` or `pi`. The immediate `profile transfer now` operands use exact `STORE/PROFILE` references. On-switch mappings always transfer Codex to PI, so `set`, `enable`, and `disable` take bare profile names. `switch` defaults to `--target both`. `auto set` requires at least one setting and accepts multiple settings atomically. Plain `service logs` prints the journal and exits; `--follow` continues following it.
+`STORE` is `codex` or `pi`. The immediate `profile transfer now` operands use exact `STORE/PROFILE` references. On-switch mappings always transfer Codex to PI, so `set`, `enable`, and `disable` take bare profile names. `switch` defaults to `--target both`. `auto set` requires at least one setting and accepts multiple settings atomically. Plain `service logs` prints the journal and exits; `--follow` continues following it. Use `tracker list` to print every tracked session's exact `SESSION_ID` before removing one.
 
 Examples:
 

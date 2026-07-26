@@ -284,6 +284,8 @@ pub struct TrackerArgs {
 }
 #[derive(Subcommand, Debug)]
 pub enum TrackerCommand {
+    /// List tracked sessions and their exact IDs
+    List,
     Remove(TrackerRemoveArgs),
 }
 #[derive(Args, Debug)]
@@ -471,6 +473,7 @@ mod tests {
                 "false",
             ],
             vec!["codex-switch", "waybar", "install"],
+            vec!["codex-switch", "tracker", "list"],
             vec!["codex-switch", "tracker", "remove", "session"],
             vec!["codex-switch", "storage"],
             vec!["codex-switch", "recovery", "restore"],

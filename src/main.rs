@@ -158,6 +158,10 @@ fn dispatch(command: Option<Command>, profile: Option<ProfileName>, ctx: &data::
             WaybarCommand::Install => waybar_config::install_waybar_config(),
         },
         Some(Command::Tracker(args)) => match args.command {
+            TrackerCommand::List => println!(
+                "{}",
+                tracker::list_sessions(ctx).unwrap_or_else(|error| data::die(&error))
+            ),
             TrackerCommand::Remove(args) => {
                 let removed = tracker::remove_session(ctx, &args.session_id)
                     .unwrap_or_else(|error| data::die(&error));

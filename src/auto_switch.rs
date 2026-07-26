@@ -425,8 +425,9 @@ pub fn run(ctx: &Context, dry_run: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_candidate, current_profile_is_enabled, profile_option_lines, set_profile_policy,
-        usage_percent, Candidate,
+        choose_candidate, codex_candidates, current_profile_is_enabled, detect_current_pi_profile,
+        percentage_from_env, pi_candidates, print_profile_options, profile_option_lines,
+        remove_profile_policy, run, set_profile_policy, show_config, usage_percent, Candidate,
     };
     use crate::data::{Context, UsageResponse};
     use crate::profile_options::{
@@ -447,6 +448,49 @@ mod tests {
             },
             base,
         )
+    }
+
+    #[test]
+    fn validates_percentage_environment_values() {
+        let name = "CODEX_SWITCH_TEST_PERCENTAGE";
+        std::env::remove_var(name);
+        assert_eq!(percentage_from_env(name, 90.0, 0.0).unwrap(), 90.0);
+        for (value, expected) in [
+            ("42.5", Some(42.5)),
+            ("nope", None),
+            ("NaN", None),
+            ("101", None),
+            ("-1", None),
+        ] {
+            std::env::set_var(name, value);
+            assert_eq!(percentage_from_env(name, 90.0, 0.0).ok(), expected);
+        }
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn command_helpers_handle_empty_and_missing_profiles() {
+        let (ctx, base) = context("command-helpers");
+        print_profile_options(&ctx).unwrap();
+        show_config(&ctx).unwrap();
+        run(&ctx, true).unwrap();
+        assert!(detect_current_pi_profile(&ctx).is_none());
+
+        let mut options = ProfileOptions::default();
+        options.profiles.insert(
+            "missing".to_string(),
+            ProfileOption {
+                auto: Some(AutoSwitchPolicy::default()),
+                transfer: None,
+            },
+        );
+        assert!(codex_candidates(&ctx, &options.profiles, "current", true).is_empty());
+        assert!(pi_candidates(&ctx, &options.profiles, "current", true).is_empty());
+
+        remove_profile_policy(&ctx, "missing").unwrap();
+        set_profile_policy(&ctx, "work", None, None, None, None).unwrap();
+        remove_profile_policy(&ctx, "work").unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

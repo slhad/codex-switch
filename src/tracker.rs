@@ -78,6 +78,25 @@ pub fn save_tracker(ctx: &Context, tracker: &AccountTracker) {
     let _ = save_tracker_result(ctx, tracker);
 }
 
+pub fn list_sessions(ctx: &Context) -> Result<String, String> {
+    let mut sessions = load_tracker_strict(ctx)?.sessions;
+    sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    if sessions.is_empty() {
+        return Ok("No tracked sessions.".to_string());
+    }
+
+    let mut output = String::from("Tracked sessions:\nSESSION_ID\tPROVIDER\tPROFILE");
+    for session in sessions {
+        output.push_str(&format!(
+            "\n{}\t{}\t{}",
+            session.session_id,
+            session.provider.as_deref().unwrap_or("-"),
+            session.profile.as_deref().unwrap_or("-")
+        ));
+    }
+    Ok(output)
+}
+
 pub fn remove_session(ctx: &Context, session_id: &str) -> Result<bool, String> {
     if session_id.is_empty() {
         return Err("tracked session ID cannot be empty".to_string());
@@ -259,9 +278,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        fingerprint_secret, load_last_snapshot, load_tracker, remove_session, save_tracker,
-        save_tracker_result, snapshot_live_auth, update_monthly_usage, update_rate_limit,
-        upsert_session,
+        fingerprint_secret, list_sessions, load_last_snapshot, load_tracker, remove_session,
+        save_tracker, save_tracker_result, snapshot_live_auth, update_monthly_usage,
+        update_rate_limit, upsert_session,
     };
     use crate::data::{
         AccountTracker, Context, TrackedAuthSnapshot, TrackedQuotaHit, TrackedSession,
@@ -433,6 +452,40 @@ mod tests {
         let monthly = tracker.sessions[0].monthly_usage.as_ref().unwrap();
         assert_eq!(monthly.remaining, Some(75.0));
         assert!(tracker.sessions[0].rate_limit.is_none());
+    }
+
+    #[test]
+    fn lists_session_ids_with_context_in_sorted_order() {
+        let (ctx, base) = test_context("list-sessions");
+        save_tracker(
+            &ctx,
+            &AccountTracker {
+                sessions: vec![
+                    TrackedSession {
+                        session_id: "pi:profile:work".to_string(),
+                        provider: Some("pi".to_string()),
+                        profile: Some("work".to_string()),
+                        ..TrackedSession::default()
+                    },
+                    TrackedSession {
+                        session_id: "codex:live".to_string(),
+                        ..TrackedSession::default()
+                    },
+                ],
+                ..AccountTracker::default()
+            },
+        );
+
+        assert_eq!(
+            list_sessions(&ctx).unwrap(),
+            "Tracked sessions:\nSESSION_ID\tPROVIDER\tPROFILE\ncodex:live\t-\t-\npi:profile:work\tpi\twork"
+        );
+
+        std::fs::remove_file(&ctx.tracker_file).unwrap();
+        assert_eq!(list_sessions(&ctx).unwrap(), "No tracked sessions.");
+        std::fs::write(&ctx.tracker_file, "invalid").unwrap();
+        assert!(list_sessions(&ctx).is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
