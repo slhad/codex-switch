@@ -1,8 +1,6 @@
 use crate::data::{read_auth, read_pi_auth, Context, PiOpenAiCodexAuth};
 use crate::jwt::{decode_token_payload, extract_email, extract_email_from_token};
-use crate::profile::{
-    detect_current_profile, list_pi_profiles, list_profiles, load_profile_transfers, profile_name,
-};
+use crate::profile::{detect_current_profile, list_pi_profiles, list_profiles, profile_name};
 use crate::rate_limit::{
     fetch_pi_rate_limit, fetch_pi_rate_limit_for_path, fetch_rate_limit,
     fetch_rate_limit_for_auth_path, format_credit_amount, parse_reset_at, summarize_reset,
@@ -103,6 +101,18 @@ fn tracked_session_display_name(entry: &crate::data::TrackedSession) -> String {
         .unwrap_or_else(|| short_id(Some(entry.account_id.as_str())))
 }
 
+fn reset_is_active(reset_at: u64, now: u64) -> bool {
+    reset_at > now
+}
+
+fn active_five_hour_window(
+    usage: &crate::data::UsageResponse,
+) -> Option<&crate::data::UsageWindow> {
+    let window = usage.five_hour_window()?;
+    let reset_at = parse_reset_at(window.reset_at.as_ref())?;
+    reset_is_active(reset_at, chrono::Utc::now().timestamp() as u64).then_some(window)
+}
+
 fn format_percentage(value: Option<f64>) -> String {
     value
         .map(|value| format!("{}", value))
@@ -201,7 +211,7 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
 
     if let Some(Ok(usage)) = &latest_rate_limit {
         if let Some((used, reset_in, reset_at)) =
-            usage.five_hour_window().and_then(summarize_window)
+            active_five_hour_window(usage).and_then(summarize_window)
         {
             println!("  5h used: {}%", used);
             println!("  5h reset: in {} ({})", reset_in, reset_at);
@@ -221,19 +231,31 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
             })
     {
         if let Some(rate_limit) = &entry.rate_limit {
-            let used = rate_limit
-                .used_percent
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            let reset_in = crate::rate_limit::format_duration_until(rate_limit.resets_at);
-            let reset_at = Local
-                .timestamp_opt(rate_limit.resets_at as i64, 0)
-                .single()
-                .map(|ts| ts.format("%Y-%m-%d %H:%M:%S %Z").to_string())
-                .unwrap_or_else(|| "?".to_string());
-
-            println!("  5h used: {}%", used);
-            println!("  5h reset: in {} ({})", reset_in, reset_at);
+            let now = chrono::Utc::now().timestamp() as u64;
+            if reset_is_active(rate_limit.resets_at, now) {
+                let used = format_percentage(rate_limit.used_percent);
+                let reset_in = crate::rate_limit::format_duration_until(rate_limit.resets_at);
+                let reset_at = Local
+                    .timestamp_opt(rate_limit.resets_at as i64, 0)
+                    .single()
+                    .map(|ts| ts.format("%Y-%m-%d %H:%M:%S %Z").to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                println!("  5h used: {}%", used);
+                println!("  5h reset: in {} ({})", reset_in, reset_at);
+            }
+            if let Some(reset_at) = rate_limit
+                .secondary_resets_at
+                .filter(|reset_at| reset_is_active(*reset_at, now))
+            {
+                println!(
+                    "  7d used: {}%",
+                    format_percentage(rate_limit.secondary_used_percent)
+                );
+                println!(
+                    "  7d reset: in {}",
+                    crate::rate_limit::format_duration_until(reset_at)
+                );
+            }
         }
     } else if let Some(Err(err)) = &latest_rate_limit {
         println!("  usage: unavailable ({})", err);
@@ -260,7 +282,8 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
     println!("Saved Codex profiles:");
 
     let profiles = list_profiles(ctx);
-    let profile_transfers = load_profile_transfers(ctx);
+    let profile_options =
+        crate::profile_options::load(ctx).unwrap_or_else(|error| crate::data::die(&error));
     for p in &profiles {
         let name = profile_name(p);
         let marker = if current_profile.as_deref() == Some(&name) {
@@ -305,10 +328,12 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
         }
 
         let is_live = if is_live_profile { " [live]" } else { "" };
-        let transfer = profile_transfers
-            .codex_to_pi
+        let transfer = profile_options
+            .profiles
             .get(&name)
-            .map(|target| format!(" [transfer→pi:{}]", target))
+            .and_then(|option| option.transfer.as_ref())
+            .filter(|transfer| transfer.enabled)
+            .map(|transfer| format!(" [transfer→pi:{}]", transfer.pi_profile))
             .unwrap_or_default();
 
         if let Some(email) = email_column_for_profile(&name, &email) {
@@ -397,6 +422,9 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
             println!("{} {:>8} {}  {}{}", marker, name, account, expires, is_live);
         }
     }
+
+    crate::auto_switch::print_profile_options(ctx).unwrap_or_else(|error| crate::data::die(&error));
+    crate::systemd::print_installation_status().unwrap_or_else(|error| crate::data::die(&error));
 
     save_tracker(ctx, &tracker);
 
@@ -515,7 +543,7 @@ fn show_pi_status(
                 usage.plan_type.as_deref().unwrap_or("?")
             );
             if let Some((used, reset_in, reset_at)) =
-                usage.five_hour_window().and_then(summarize_window)
+                active_five_hour_window(usage).and_then(summarize_window)
             {
                 println!("  5h used: {}%", used);
                 println!("  5h reset: in {} ({})", reset_in, reset_at);
@@ -640,10 +668,11 @@ fn show_tracked_sessions(tracker: &crate::data::AccountTracker, current_session_
         };
         let provider = entry.provider.as_deref().unwrap_or("?");
         print!(
-            "{} {:>5} {}",
+            "{} {:>5} {}  id:{}",
             marker,
             provider,
-            tracked_session_display_name(&entry)
+            tracked_session_display_name(&entry),
+            entry.session_id
         );
 
         if entry.has_refresh {
@@ -675,34 +704,25 @@ fn show_tracked_sessions(tracker: &crate::data::AccountTracker, current_session_
                 remaining,
                 reset
             );
-        } else {
-            let used_5h = entry
-                .rate_limit
-                .as_ref()
-                .and_then(|rate_limit| rate_limit.used_percent)
-                .map(|value| format!("{}%", value))
-                .unwrap_or_else(|| "?%".to_string());
-            let reset_5h = entry
-                .rate_limit
-                .as_ref()
-                .map(|rate_limit| crate::rate_limit::format_duration_until(rate_limit.resets_at))
-                .unwrap_or_else(|| "?".to_string());
-            let used_7d = entry
-                .rate_limit
-                .as_ref()
-                .and_then(|rate_limit| rate_limit.secondary_used_percent)
-                .map(|value| format!("{}%", value))
-                .unwrap_or_else(|| "?%".to_string());
-            let reset_7d = entry
-                .rate_limit
-                .as_ref()
-                .and_then(|rate_limit| rate_limit.secondary_resets_at)
-                .map(crate::rate_limit::format_duration_until)
-                .unwrap_or_else(|| "?".to_string());
-            print!(
-                "  5h:{} reset:{}  7d:{} reset:{}",
-                used_5h, reset_5h, used_7d, reset_7d
-            );
+        } else if let Some(rate_limit) = entry.rate_limit.as_ref() {
+            let now = chrono::Utc::now().timestamp() as u64;
+            if reset_is_active(rate_limit.resets_at, now) {
+                print!(
+                    "  5h:{}% reset:{}",
+                    format_percentage(rate_limit.used_percent),
+                    crate::rate_limit::format_duration_until(rate_limit.resets_at)
+                );
+            }
+            if let Some(reset_at) = rate_limit
+                .secondary_resets_at
+                .filter(|reset_at| reset_is_active(*reset_at, now))
+            {
+                print!(
+                    "  7d:{}% reset:{}",
+                    format_percentage(rate_limit.secondary_used_percent),
+                    crate::rate_limit::format_duration_until(reset_at)
+                );
+            }
         }
 
         println!();
@@ -711,8 +731,42 @@ fn show_tracked_sessions(tracker: &crate::data::AccountTracker, current_session_
 
 #[cfg(test)]
 mod tests {
-    use super::{email_column_for_profile, tracked_session_display_name};
-    use crate::data::TrackedSession;
+    use super::{
+        active_five_hour_window, email_column_for_profile, reset_is_active,
+        tracked_session_display_name,
+    };
+    use crate::data::{TrackedSession, UsageResponse};
+
+    #[test]
+    fn hides_expired_five_hour_windows() {
+        assert!(!reset_is_active(100, 100));
+        assert!(!reset_is_active(99, 100));
+        assert!(reset_is_active(101, 100));
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let expired: UsageResponse = serde_json::from_value(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 80,
+                    "limit_window_seconds": 18000,
+                    "reset_at": now.saturating_sub(1)
+                }
+            }
+        }))
+        .unwrap();
+        let active: UsageResponse = serde_json::from_value(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 80,
+                    "limit_window_seconds": 18000,
+                    "reset_at": now + 3600
+                }
+            }
+        }))
+        .unwrap();
+        assert!(active_five_hour_window(&expired).is_none());
+        assert!(active_five_hour_window(&active).is_some());
+    }
 
     #[test]
     fn email_column_omits_email_when_profile_is_same_email() {

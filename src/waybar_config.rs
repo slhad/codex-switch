@@ -6,7 +6,7 @@ const WAYBAR_FORMAT: &str = "{usage_block_pango}";
 
 fn waybar_exec() -> String {
     format!(
-        "{} --waybar --format '{}'",
+        "{} waybar print --format '{}'",
         shell_quote(&codex_switch_command()),
         WAYBAR_FORMAT
     )
@@ -326,7 +326,8 @@ mod tests {
 "##;
 
         let updated = ensure_common_module(input);
-        assert!(updated.contains("codex-switch --waybar"));
+        assert!(updated.contains("codex-switch waybar print"));
+        assert!(!updated.contains("--waybar"));
         assert!(updated.contains("\"interval\": 999"));
     }
 
@@ -374,7 +375,7 @@ mod tests {
 
         let updated = ensure_inline_waybar_config(input);
         assert!(updated.contains("\"custom/codex-usage\""));
-        assert!(updated.contains("codex-switch --waybar"));
+        assert!(updated.contains("codex-switch waybar print"));
         assert!(updated.contains("\"pulseaudio\",\n      \"custom/codex-usage\","));
     }
 
@@ -391,7 +392,7 @@ mod tests {
 "#;
 
         let updated = ensure_inline_waybar_config(input);
-        assert_eq!(updated.matches("codex-switch --waybar").count(), 2);
+        assert_eq!(updated.matches("codex-switch waybar print").count(), 2);
         assert_eq!(updated.matches("custom/codex-usage").count(), 4);
     }
 }

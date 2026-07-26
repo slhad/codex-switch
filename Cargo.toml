@@ -16,3 +16,4 @@ clap = { version = "4", features = ["derive"] }
 nix = { version = "0.29", features = ["process", "signal"] }
 thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+clap_complete = { version = "4.6.7", features = ["unstable-dynamic"] }

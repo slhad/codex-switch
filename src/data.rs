@@ -336,9 +336,9 @@ impl Context {
         self.state_dir.join("profiles").join("pi")
     }
 
-    /// Returns the persisted Codex-to-PI transfer mappings.
-    pub fn profile_transfers_path(&self) -> PathBuf {
-        self.state_dir.join("profile-transfers.json")
+    /// Returns the unified profile automatic-switch and transfer options.
+    pub fn profile_options_path(&self) -> PathBuf {
+        self.state_dir.join("profile-options.json")
     }
 
     /// Returns the path for a profile file, e.g. ~/.local/state/codex-switch/profiles/codex/auth.json.work
@@ -398,6 +398,9 @@ mod tests {
         assert!(ctx.live_auth.ends_with(".codex/auth.json"));
         assert!(ctx.pi_auth.ends_with(".pi/agent/auth.json"));
         assert!(ctx.tracker_file.ends_with("codex-switch/accounts.json"));
+        assert!(ctx
+            .profile_options_path()
+            .ends_with("codex-switch/profile-options.json"));
         assert!(ctx.profile_path("work").ends_with("codex/auth.json.work"));
         assert!(ctx.pi_profile_path("work").ends_with("pi/auth.json.work"));
     }

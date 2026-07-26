@@ -1,91 +1,154 @@
 # codex-switch
 
-Rust CLI for switching between Codex auth profiles and inspecting OAuth-backed usage for both the live Codex auth and PI agent auth.
+Rust CLI for switching saved Codex and PI OAuth profiles and inspecting OAuth-backed usage.
 
-## Project Structure
-Core code lives in `src/`:
+## Overview
 
-- `main.rs` wires CLI parsing to runtime actions.
-- `cli.rs` defines flags and arguments with `clap`.
-- `data.rs` holds shared data structures for auth files, decoded JWT claims, usage payloads, and filesystem context.
-- `status.rs` prints live auth state, PI agent auth state, and usage summaries.
-- `rate_limit.rs` fetches usage from the OAuth-backed ChatGPT usage endpoint and handles token refresh. OAuth refresh client IDs are derived from existing JWT claims rather than hardcoded.
-- `jwt.rs` decodes JWT payloads for email, audience, and PI/OpenAI claim inspection.
-- `waybar.rs` prints Waybar JSON for active usage text plus all-profile tooltip/alt data.
-- `waybar_config.rs` installs or updates the user Waybar module definition/layout without replacing unrelated config.
-- `switch.rs`, `profile.rs`, `process.rs`, and `install.rs` each own one functional area.
+This project is OAuth-only. It reads live credentials from `~/.codex/auth.json` and `~/.pi/agent/auth.json`, derives OAuth client IDs from available JWT claims, and queries the ChatGPT usage endpoint. Saved profiles, automatic-switch policies, transfer mappings, and tracker state live under `~/.local/state/codex-switch/`.
 
-Build artifacts go to `target/`. Temporary planning notes live in `tmp/` and should not be treated as source of truth.
+Before a switch, the current Codex auth is stored as a recovery snapshot. Saved Codex and PI profiles remain separate from live auth. Profile names may contain only ASCII letters, digits, `_`, and `-`.
 
-## Usage
-This project is OAuth-only. It reads `~/.codex/auth.json` and `~/.pi/agent/auth.json`, refreshes tokens when needed, derives the OAuth refresh client ID from JWT claims, and queries the ChatGPT usage endpoint for personal 5-hour/7-day windows or Business monthly credit spend controls.
+Automatic switching runs only when the current profile has an enabled automatic-switch policy for the relevant Codex or PI store, then evaluates the highest reported consumption across applicable windows. Its default threshold is 90%, with a 5% selection step. Codex and PI candidates are selected independently by eligibility, priority, usage, and name. `profile transfer now codex/NAME pi/NAME` performs an immediate transfer and remembers an enabled mapping for later normal switches.
 
-Before a profile switch, the current live auth is now stored as a single recovery snapshot inside `~/.local/state/codex-switch/accounts.json`. Use `--restore-last` to put that snapshot back into `~/.codex/auth.json`.
+## Build and test
 
-Saved Codex and PI profiles are managed under `~/.local/state/codex-switch/profiles/` rather than alongside the live auth files. Status and Waybar tooltip/alt output can refresh and display quota/reset data for saved profiles, not just the active live auth.
+Use the local `rtk` wrapper:
 
-A `codex` → `pi` transfer such as `--transfer-profile codex/mate pi/mate` is remembered in `~/.local/state/codex-switch/profile-transfers.json`. A later normal switch to that Codex profile regenerates the mapped PI profile from the latest saved Codex OAuth tokens and activates it. Profiles without a remembered transfer are unchanged, so a PI-native profile such as `me` remains independent. The default status command marks remembered mappings as `[transfer→pi:PROFILE]`. Profile names may contain only ASCII letters, digits, `_`, and `-`.
+```bash
+rtk cargo fmt
+rtk cargo test
+rtk scripts/check-coverage.sh
+rtk cargo build --release
+```
 
-## Build And Test
-Use the local `rtk` wrapper for shell commands in this repo.
+The release binary is `target/release/codex-switch`.
 
-- `rtk cargo build` builds the debug binary.
-- `rtk cargo build --release` builds the optimized binary at `target/release/codex-switch`.
-- `rtk cargo test` runs unit tests.
-- `rtk scripts/check-coverage.sh` runs unit tests with LLVM coverage and requires region, function, line, and branch coverage to each be at least 95%.
-- `rtk cargo fmt` formats the crate with `rustfmt`.
-- `rtk cargo run -- --help` checks CLI behavior quickly.
-- `rtk cargo run -- --debug-usage` prints the raw live Codex OAuth usage payload.
-- `rtk cargo run -- --debug-pi-usage` prints the raw PI agent OAuth usage payload.
-- `rtk cargo run -- --waybar` prints Waybar JSON for Codex usage: active profile in `text`, all saved Codex/PI profiles in `tooltip` and `alt`.
-- `rtk cargo run -- --install-waybar-config` installs or updates the `custom/codex-usage` Waybar module while preserving existing user config and writing timestamped backups. If `~/.config/waybar/common.jsonc` exists it is used for the shared module definition; otherwise the module is added inline to the standard Waybar `config.jsonc` object(s).
-- `rtk cargo run -- --storage` shows where live auth, saved profiles, and tracker files are stored.
-- `rtk cargo run -- --stop-remote` safely stops the Codex app server that owns `~/.codex/app-server-control/app-server-control.sock`, including SSH-bootstrapped servers that `codex remote-control stop` cannot manage.
-- `rtk cargo run -- --save-profile codex me` saves the current live Codex auth into the managed `me` profile.
-- `rtk cargo run -- --save-profile pi me` saves the current live PI auth into the managed `me` profile.
-- `rtk cargo run -- --import-profile work ~/Downloads/auth.json` validates and imports a Codex OAuth `auth.json` into the managed `work` profile. It displays the imported auth information but does not modify live auth or activate the profile.
+## CLI
+
+Running with no arguments is equivalent to `status`. A bare profile name is shorthand for switching both Codex and PI; profile names that match a command name must use the explicit `switch` form.
+
+```text
+codex-switch
+codex-switch PROFILE
+codex-switch status [--debug codex|pi|all]
+codex-switch switch PROFILE [--target codex|pi|both] [--force] [--kill]
+codex-switch stop [--remote-only]
+
+codex-switch profile save STORE NAME
+codex-switch profile remove STORE NAME
+codex-switch profile import codex NAME AUTH_JSON [--force]
+codex-switch profile transfer now SOURCE TARGET
+codex-switch profile transfer on-switch set SOURCE TARGET
+codex-switch profile transfer on-switch enable SOURCE
+codex-switch profile transfer on-switch disable SOURCE
+
+codex-switch auto run [--dry-run]
+codex-switch auto show
+codex-switch auto set PROFILE [--enabled BOOL] [--priority NUMBER] [--codex BOOL] [--pi BOOL]
+codex-switch auto remove PROFILE
+
+codex-switch service install
+codex-switch service uninstall
+codex-switch service logs [--follow]
+codex-switch link install
+codex-switch link uninstall
+
+codex-switch waybar print [--format FORMAT] [--tooltip-format FORMAT]
+    [--waybar-hide-minutes-with-days BOOL]
+    [--waybar-hide-hours-with-days BOOL]
+codex-switch waybar install
+
+codex-switch tracker remove SESSION_ID
+codex-switch storage
+codex-switch recovery restore
+
+codex-switch completion bash
+codex-switch completion install [--force]
+```
+
+`STORE` is `codex` or `pi`. The immediate `profile transfer now` operands use exact `STORE/PROFILE` references. On-switch mappings always transfer Codex to PI, so `set`, `enable`, and `disable` take bare profile names. `switch` defaults to `--target both`. `auto set` requires at least one setting and accepts multiple settings atomically. Plain `service logs` prints the journal and exits; `--follow` continues following it.
 
 Examples:
 
 ```bash
-rtk target/release/codex-switch --install-link
-rtk target/release/codex-switch --import-profile work ~/Downloads/auth.json
-rtk target/release/codex-switch --force --import-profile work ~/Downloads/auth.json
+rtk cargo run -- status --debug all
+rtk cargo run -- switch work --target codex
+rtk cargo run -- profile save codex work
+rtk cargo run -- profile import codex work ./auth.json
+rtk cargo run -- profile transfer now codex/work pi/work
+rtk cargo run -- profile transfer on-switch disable work
+rtk cargo run -- auto set work --priority 100 --pi false
+rtk cargo run -- auto run --dry-run
+rtk cargo run -- service logs
+rtk cargo run -- waybar print
+rtk cargo run -- storage
 ```
 
-## CLI Flags
-The current CLI surface is:
+## Bash completion
 
-- `-k`, `--kill` to stop running Codex desktop instances and the remote app server before switching
-- `--stop-remote` to stop only the Codex app server that owns the remote-control socket; the process command line is validated before it is signaled
-- `--debug-usage` to print the raw live Codex OAuth usage payload
-- `--debug-pi-usage` to print the raw PI agent OAuth usage payload
-- `--waybar` to print Waybar JSON for Codex usage; `text` is active-profile only, while default `tooltip` and `alt` include all saved Codex/PI profiles
-- `--waybar-hide-minutes-with-days <true|false>` to omit minutes from Waybar reset durations when days are present; enabled by default to keep the module compact
-- `--waybar-hide-hours-with-days <true|false>` to omit hours from Waybar reset durations when days are present; also enabled by default, so day-based resets normally render as just `6d`
-- `--format` to customize the Waybar text output; supports `{usage_block}`, `{usage_block_pango}`, `{icon}`, `{icon_plain}`, `{time_icon}`, `{time_icon_plain}`, `{5h_block}`, `{5h_block_pango}`, `{5h_pct}`, `{7d_pct}`, `{5h_reset}`, `{7d_reset}`, `{monthly_limit}`, `{monthly_used}`, `{monthly_remaining}`, `{monthly_used_pct}`, `{monthly_remaining_pct}`, `{monthly_reset}`, `{status}`, `{profile}`, `{provider}`, `{email}`, `{pct}`, `{reset}`, and `{win}`. The usage block automatically renders personal rate limits or Business monthly credits; the 5-hour block tokens expand to nothing when that quota window is absent.
-- `--tooltip-format` to customize the Waybar tooltip for the active profile; omit it to show all saved Codex and PI profiles
-- `--install-waybar-config` to add/update `custom/codex-usage` in Waybar config without replacing unrelated settings; it uses `~/.config/waybar/common.jsonc` when present, otherwise it edits standard inline `~/.config/waybar/config.jsonc` object(s)
-- `--codex` with `[PROFILE]` to switch only the Codex auth profile
-- `--pi` with `[PROFILE]` to switch only the PI auth profile
-- `--force` to switch even if the current auth does not match a known profile
-- `--install-link` to install the `codex-switch` symlink
-- `--remove-link` to remove the `codex-switch` symlink
-- `--restore-last` to restore the last tracker-backed auth snapshot
-- `--storage` to show where live auth, saved profiles, and tracker files are stored
-- `--save-profile STORE NAME` to save the current live `codex` or `pi` auth into a named profile
-- `--transfer-profile SOURCE_STORE/SOURCE_PROFILE TARGET_STORE/TARGET_PROFILE` (for example, `--transfer-profile codex/mate pi/mate`) to transfer OAuth auth immediately; Codex-to-PI mappings are remembered for future normal switches
-- `--import-profile NAME AUTH_JSON` to import a Codex OAuth file into `~/.local/state/codex-switch/profiles/codex/auth.json.NAME`; after importing it displays the profile path, email, account, auth mode, and last refresh without changing live `~/.codex/auth.json`
-- `--force --import-profile NAME AUTH_JSON` to replace an existing imported profile; without `--force`, existing profiles are preserved
-- `[PROFILE]` to switch to a named saved profile
+Enable completion for the current shell without installing a file:
 
-## Development Notes
-Follow standard Rust style and keep formatting `rustfmt`-clean. Use 4-space indentation, `snake_case` for functions/modules, `PascalCase` for structs/enums, and short focused modules. Prefer explicit error messages through the existing `die(...)` helper for user-facing failures. Keep CLI text stable and concise because this tool is intended for terminal use.
+```bash
+source <(codex-switch completion bash)
+```
 
-No usable Git history is present in this working copy, so follow a simple imperative style for commits, for example: `Add install/remove link flags`. Keep commits scoped to one behavioral change.
+Install it for future Bash sessions:
 
-PRs should include:
+```bash
+codex-switch completion install
+```
 
-- a short summary of the user-visible change
-- commands used for verification
-- any filesystem side effects, such as refreshing `~/.codex/auth.json` tokens or creating/removing symlinks in `~/bin`
+The default destination is `${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/codex-switch`. A relative `XDG_DATA_HOME` is ignored and falls back to the absolute `HOME` path. Parent directories are created as needed. Reinstalling identical content is a no-op; a different existing file is atomically preserved unless `--force` is supplied. The installed loader asks the running `codex-switch` binary for completions, so saved Codex and PI profile names update dynamically without reinstalling. Profile removal candidates follow its `STORE`; profile import keeps normal filename completion for `AUTH_JSON`.
+
+## Automatic switching service
+
+`service install` writes and enables a systemd user oneshot service and timer. The generated service runs:
+
+```text
+codex-switch auto run
+```
+
+Configuration environment variables:
+
+- `CODEX_SWITCH_THRESHOLD_PERCENT` (default `90`)
+- `CODEX_SWITCH_THRESHOLD_STEP_PERCENT` (default `5`)
+- `CODEX_SWITCH_TIMER_BOOT_DELAY` (default `2min`)
+- `CODEX_SWITCH_TIMER_INTERVAL` (default `5min`)
+
+For example:
+
+```bash
+CODEX_SWITCH_THRESHOLD_PERCENT=85 \
+CODEX_SWITCH_TIMER_INTERVAL=10min \
+  target/release/codex-switch service install
+```
+
+Service uninstall preserves profile policies.
+
+## Waybar
+
+`waybar print` emits JSON with the active profile in `text` and saved profile details in `tooltip` and `alt`. `waybar install` adds or updates `custom/codex-usage` while preserving unrelated settings and writing a timestamped backup before editing. Generated configuration invokes `codex-switch waybar print`.
+
+Format tokens include `{usage_block}`, `{usage_block_pango}`, `{icon}`, `{time_icon}`, `{5h_pct}`, `{7d_pct}`, `{monthly_used_pct}`, `{status}`, `{profile}`, `{provider}`, `{email}`, `{pct}`, `{reset}`, and `{win}`.
+
+## PI OAuth hot-reload extension
+
+This repository is also a PI package. Its extension wraps PI's public `openai-codex` provider authentication and reads the current OAuth credential from `~/.pi/agent/auth.json` whenever PI resolves request authentication. It changes only that provider and never logs access or refresh tokens.
+
+Install from this checkout and restart PI:
+
+```bash
+pi install /absolute/path/to/codex-switch
+```
+
+Runtime controls:
+
+```text
+/codex-switch-auth-reload status
+/codex-switch-auth-reload off
+/codex-switch-auth-reload on
+```
+
+## Project structure
+
+Core code lives in `src/`: `cli.rs` defines the Clap hierarchy, `main.rs` dispatches commands, `completions.rs` generates and installs dynamic shell completion, `status.rs` and `waybar.rs` render usage, `switch.rs` and `profile.rs` manage profiles, `auto_switch.rs` and `profile_options.rs` manage policy, and `systemd.rs`/`waybar_config.rs` generate integrations.

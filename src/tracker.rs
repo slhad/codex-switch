@@ -20,20 +20,89 @@ pub fn load_tracker(ctx: &Context) -> AccountTracker {
     normalize_tracker(serde_json::from_str(&content).unwrap_or_default())
 }
 
-pub fn save_tracker(ctx: &Context, tracker: &AccountTracker) {
-    if std::fs::create_dir_all(&ctx.state_dir).is_err() {
-        return;
-    }
+fn load_tracker_strict(ctx: &Context) -> Result<AccountTracker, String> {
+    let content = match std::fs::read_to_string(&ctx.tracker_file) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AccountTracker::default())
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to read account tracker {}: {}",
+                ctx.tracker_file.display(),
+                error
+            ))
+        }
+    };
+    serde_json::from_str(&content)
+        .map(normalize_tracker)
+        .map_err(|error| {
+            format!(
+                "invalid account tracker JSON {}: {}",
+                ctx.tracker_file.display(),
+                error
+            )
+        })
+}
+
+fn save_tracker_result(ctx: &Context, tracker: &AccountTracker) -> Result<(), String> {
+    std::fs::create_dir_all(&ctx.state_dir).map_err(|error| {
+        format!(
+            "failed to create state directory {}: {}",
+            ctx.state_dir.display(),
+            error
+        )
+    })?;
 
     let normalized = normalize_tracker(tracker.clone());
-    let Ok(json) = serde_json::to_string_pretty(&normalized) else {
-        return;
-    };
+    let json = serde_json::to_string_pretty(&normalized)
+        .map_err(|error| format!("failed to serialize account tracker: {}", error))?;
     let tmp_file = ctx.state_dir.join("accounts.json.tmp");
-    if std::fs::write(&tmp_file, json).is_err() {
-        return;
+    std::fs::write(&tmp_file, json).map_err(|error| {
+        format!(
+            "failed to write temporary account tracker {}: {}",
+            tmp_file.display(),
+            error
+        )
+    })?;
+    std::fs::rename(&tmp_file, &ctx.tracker_file).map_err(|error| {
+        format!(
+            "failed to replace account tracker {}: {}",
+            ctx.tracker_file.display(),
+            error
+        )
+    })
+}
+
+pub fn save_tracker(ctx: &Context, tracker: &AccountTracker) {
+    let _ = save_tracker_result(ctx, tracker);
+}
+
+pub fn remove_session(ctx: &Context, session_id: &str) -> Result<bool, String> {
+    if session_id.is_empty() {
+        return Err("tracked session ID cannot be empty".to_string());
     }
-    let _ = std::fs::rename(tmp_file, &ctx.tracker_file);
+
+    let mut tracker = load_tracker_strict(ctx)?;
+    let original_len = tracker.sessions.len();
+    tracker
+        .sessions
+        .retain(|entry| entry.session_id != session_id);
+    let removed = tracker.sessions.len() != original_len;
+    if !removed {
+        return Ok(false);
+    }
+
+    if tracker
+        .last_quota_hit
+        .as_ref()
+        .and_then(|hit| hit.session_id.as_deref())
+        == Some(session_id)
+    {
+        tracker.last_quota_hit = None;
+    }
+    save_tracker_result(ctx, &tracker)?;
+    Ok(true)
 }
 
 pub fn snapshot_auth_json(ctx: &Context, auth_json: String, profile: Option<String>) {
@@ -190,10 +259,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        fingerprint_secret, load_last_snapshot, load_tracker, save_tracker, snapshot_live_auth,
-        update_monthly_usage, update_rate_limit, upsert_session,
+        fingerprint_secret, load_last_snapshot, load_tracker, remove_session, save_tracker,
+        save_tracker_result, snapshot_live_auth, update_monthly_usage, update_rate_limit,
+        upsert_session,
     };
-    use crate::data::{AccountTracker, Context, TrackedAuthSnapshot};
+    use crate::data::{
+        AccountTracker, Context, TrackedAuthSnapshot, TrackedQuotaHit, TrackedSession,
+    };
 
     fn test_context(name: &str) -> (Context, PathBuf) {
         let unique = SystemTime::now()
@@ -364,6 +436,52 @@ mod tests {
     }
 
     #[test]
+    fn removes_exact_session_and_related_quota_hit() {
+        let (ctx, base) = test_context("remove-session");
+        let tracker = AccountTracker {
+            sessions: vec![
+                TrackedSession {
+                    session_id: "pi:profile:me".to_string(),
+                    ..TrackedSession::default()
+                },
+                TrackedSession {
+                    session_id: "codex:live".to_string(),
+                    ..TrackedSession::default()
+                },
+            ],
+            last_quota_hit: Some(TrackedQuotaHit {
+                session_id: Some("pi:profile:me".to_string()),
+                ..TrackedQuotaHit::default()
+            }),
+            ..AccountTracker::default()
+        };
+        save_tracker(&ctx, &tracker);
+
+        assert!(remove_session(&ctx, "pi:profile:me").unwrap());
+        let loaded = load_tracker(&ctx);
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(loaded.sessions[0].session_id, "codex:live");
+        assert!(loaded.last_quota_hit.is_none());
+        assert!(!remove_session(&ctx, "pi:profile:missing").unwrap());
+        assert!(remove_session(&ctx, "").is_err());
+
+        std::fs::write(&ctx.tracker_file, "invalid").unwrap();
+        assert!(remove_session(&ctx, "codex:live").is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn remove_session_handles_missing_and_unreadable_tracker_files() {
+        let (ctx, base) = test_context("remove-session-read-errors");
+        assert!(!remove_session(&ctx, "missing").unwrap());
+
+        std::fs::create_dir_all(&ctx.tracker_file).unwrap();
+        let error = remove_session(&ctx, "missing").unwrap_err();
+        assert!(error.contains("failed to read account tracker"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn save_tracker_tolerates_unwritable_paths() {
         let (blocked_dir_ctx, blocked_dir_base) = test_context("tracker-blocked-dir");
         std::fs::create_dir_all(blocked_dir_ctx.state_dir.parent().unwrap()).unwrap();
@@ -377,5 +495,14 @@ mod tests {
         save_tracker(&blocked_tmp_ctx, &AccountTracker::default());
         assert!(!blocked_tmp_ctx.tracker_file.exists());
         std::fs::remove_dir_all(blocked_tmp_base).unwrap();
+
+        let (blocked_rename_ctx, blocked_rename_base) = test_context("tracker-blocked-rename");
+        std::fs::create_dir_all(&blocked_rename_ctx.tracker_file).unwrap();
+        assert!(
+            save_tracker_result(&blocked_rename_ctx, &AccountTracker::default())
+                .unwrap_err()
+                .contains("failed to replace account tracker")
+        );
+        std::fs::remove_dir_all(blocked_rename_base).unwrap();
     }
 }

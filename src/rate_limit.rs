@@ -15,6 +15,30 @@ pub fn fetch_rate_limit(ctx: &Context) -> Result<UsageResponse, String> {
     fetch_rate_limit_for_auth_path(&ctx.live_auth).map(|(usage, _)| usage)
 }
 
+pub fn fetch_rate_limit_read_only(ctx: &Context) -> Result<UsageResponse, String> {
+    fetch_rate_limit_for_auth_path_read_only(&ctx.live_auth)
+}
+
+pub fn fetch_rate_limit_for_auth_path_read_only(path: &Path) -> Result<UsageResponse, String> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+    let auth = read_auth(path);
+    let response = send_usage_request(&client, &auth)?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("401 unauthorized from usage API; dry-run does not refresh tokens".to_string());
+    }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err("403 forbidden from usage API".to_string());
+    }
+    response
+        .error_for_status()
+        .map_err(|e| format!("usage request failed: {}", e))?
+        .json::<UsageResponse>()
+        .map_err(|e| format!("invalid usage response: {}", e))
+}
+
 pub fn fetch_rate_limit_for_auth_path(path: &Path) -> Result<(UsageResponse, AuthFile), String> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -53,6 +77,34 @@ pub fn fetch_pi_rate_limit(
     auth: PiOpenAiCodexAuth,
 ) -> Result<(UsageResponse, PiOpenAiCodexAuth), String> {
     fetch_pi_rate_limit_for_path(&ctx.pi_auth, auth)
+}
+
+pub fn fetch_pi_rate_limit_read_only(auth: &PiOpenAiCodexAuth) -> Result<UsageResponse, String> {
+    fetch_pi_rate_limit_for_auth_read_only(auth)
+}
+
+pub fn fetch_pi_rate_limit_for_auth_read_only(
+    auth: &PiOpenAiCodexAuth,
+) -> Result<UsageResponse, String> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+    let response =
+        send_usage_request_with_token(&client, &auth.access, auth.account_id.as_deref())?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(
+            "401 unauthorized from PI usage API; dry-run does not refresh tokens".to_string(),
+        );
+    }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err("403 forbidden from PI usage API".to_string());
+    }
+    response
+        .error_for_status()
+        .map_err(|e| format!("usage request failed: {}", e))?
+        .json::<UsageResponse>()
+        .map_err(|e| format!("invalid usage response: {}", e))
 }
 
 pub fn fetch_pi_rate_limit_for_path(

@@ -1,0 +1,21 @@
+{
+  "name": "codex-switch-pi-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PI extension for hot-reloading OpenAI Codex OAuth profiles switched by codex-switch",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codex",
+    "oauth"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/codex-switch-auth-hot-reload.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

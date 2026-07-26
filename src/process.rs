@@ -2,69 +2,49 @@ use crate::data::Context;
 use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Find PIDs of Codex desktop processes.
-fn list_codex_desktop_pids() -> Vec<u32> {
+fn list_matching_pids(proc_root: &Path, predicate: fn(&[String]) -> bool) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
     let mut pids = Vec::new();
 
-    let proc_dir = PathBuf::from("/proc");
-    let entries = match std::fs::read_dir(&proc_dir) {
-        Ok(e) => e,
-        Err(_) => return pids,
-    };
-
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        // Only consider numeric directories (PIDs)
-        if !path.is_dir()
-            || !path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .parse::<u32>()
-                .is_ok()
-        {
+    for entry in entries.filter_map(Result::ok) {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
             continue;
-        }
-
-        let cmdline_path = path.join("cmdline");
-        let file = match File::open(&cmdline_path) {
-            Ok(f) => f,
-            Err(_) => continue,
         };
-
-        let reader = BufReader::new(file);
-        let cmdline = reader
-            .lines()
-            .next()
-            .and_then(|l| l.ok())
-            .unwrap_or_default();
-
-        if cmdline.contains("/opt/codex-desktop/")
-            || cmdline.contains("codex app-server --remote-control")
-        {
-            let pid = path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .parse::<u32>()
-                .unwrap();
+        if read_cmdline(proc_root, pid).is_ok_and(|args| predicate(&args)) {
             pids.push(pid);
         }
     }
 
-    pids.sort();
+    pids.sort_unstable();
     pids.dedup();
     pids
 }
 
+fn is_codex_desktop(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|executable| executable.contains("/opt/codex-desktop/"))
+}
+
+fn list_codex_desktop_pids(proc_root: &Path) -> Vec<u32> {
+    list_matching_pids(proc_root, is_codex_desktop)
+}
+
+fn list_codex_app_server_pids(proc_root: &Path) -> Vec<u32> {
+    list_matching_pids(proc_root, is_codex_app_server)
+}
+
 pub fn kill_codex_desktop(_ctx: &Context) {
-    let pids = list_codex_desktop_pids();
+    let pids = list_codex_desktop_pids(Path::new("/proc"));
 
     if pids.is_empty() {
         println!("No Codex desktop instances found.");
@@ -90,53 +70,58 @@ pub fn stop_codex_remote(ctx: &Context) -> Result<(), String> {
 }
 
 fn stop_remote_at(socket: &Path, proc_root: &Path) -> Result<(), String> {
-    let Some(inode) = find_socket_inode(socket, proc_root)? else {
+    let inode = find_socket_inode(socket, proc_root)?;
+    let mut pids = if let Some(inode) = inode {
+        let owners = find_socket_owners(inode, proc_root)?;
+        if owners.is_empty() {
+            return Err(format!(
+                "the remote control socket is active, but its owning process could not be identified: {}",
+                socket.display()
+            ));
+        }
+        for pid in &owners {
+            let args = read_cmdline(proc_root, *pid)?;
+            if !is_codex_app_server(&args) {
+                return Err(format!(
+                    "refusing to stop pid {} because it is not a Codex app-server: {}",
+                    pid,
+                    args.join(" ")
+                ));
+            }
+        }
+        owners
+    } else {
+        Vec::new()
+    };
+
+    pids.extend(list_codex_app_server_pids(proc_root));
+    pids.sort_unstable();
+    pids.dedup();
+    if pids.is_empty() {
         remove_stale_socket(socket)?;
         println!("No Codex remote app server found.");
         return Ok(());
-    };
-
-    let owners = find_socket_owners(inode, proc_root)?;
-    if owners.is_empty() {
-        return Err(format!(
-            "the remote control socket is active, but its owning process could not be identified: {}",
-            socket.display()
-        ));
-    }
-
-    for pid in &owners {
-        let args = read_cmdline(proc_root, *pid)?;
-        if !is_codex_app_server(&args) {
-            return Err(format!(
-                "refusing to stop pid {} because it is not a Codex app-server: {}",
-                pid,
-                args.join(" ")
-            ));
-        }
     }
 
     println!("Stopping Codex remote app server:");
-    for pid in &owners {
+    for pid in &pids {
         println!("  pid {}", pid);
         signal(*pid, Signal::SIGTERM)?;
     }
 
-    if wait_for_socket_to_stop(socket, proc_root, Duration::from_secs(5))? {
+    if wait_for_remote_to_stop(socket, proc_root, &pids, Duration::from_secs(5))? {
         remove_stale_socket(socket)?;
         println!("Codex remote app server stopped.");
         return Ok(());
     }
 
     println!("Remote app server did not stop after TERM; sending KILL.");
-    for pid in &owners {
+    for pid in &pids {
         signal(*pid, Signal::SIGKILL)?;
     }
 
-    if !wait_for_socket_to_stop(socket, proc_root, Duration::from_secs(2))? {
-        return Err(format!(
-            "Codex remote app server is still listening on {}",
-            socket.display()
-        ));
+    if !wait_for_remote_to_stop(socket, proc_root, &pids, Duration::from_secs(2))? {
+        return Err("Codex remote app server is still running".to_string());
     }
 
     remove_stale_socket(socket)?;
@@ -216,14 +201,21 @@ fn signal(pid: u32, signal: Signal) -> Result<(), String> {
     }
 }
 
-fn wait_for_socket_to_stop(
+fn wait_for_remote_to_stop(
     socket: &Path,
     proc_root: &Path,
+    pids: &[u32],
     timeout: Duration,
 ) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if find_socket_inode(socket, proc_root)?.is_none() {
+        let socket_stopped = find_socket_inode(socket, proc_root)?.is_none();
+        let processes_stopped = pids.iter().all(|pid| {
+            read_cmdline(proc_root, *pid)
+                .map(|args| !is_codex_app_server(&args))
+                .unwrap_or(true)
+        });
+        if socket_stopped && processes_stopped {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -243,9 +235,13 @@ fn remove_stale_socket(socket: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_socket_inode, find_socket_owners, is_codex_app_server, read_cmdline};
+    use super::{
+        find_socket_inode, find_socket_owners, is_codex_app_server, list_codex_app_server_pids,
+        list_codex_desktop_pids, read_cmdline, stop_remote_at, wait_for_remote_to_stop,
+    };
     use std::os::unix::fs::symlink;
     use std::path::Path;
+    use std::time::Duration;
 
     fn fixture(name: &str) -> std::path::PathBuf {
         let suffix = std::time::SystemTime::now()
@@ -305,17 +301,88 @@ mod tests {
     }
 
     #[test]
-    fn missing_socket_is_not_reported_active() {
+    fn discovers_nul_separated_app_server_without_false_positives() {
+        let proc_root = fixture("app-server-pids");
+        for (pid, cmdline) in [
+            (
+                123,
+                b"/opt/codex/bin/codex\0app-server\0--remote-control\0".as_slice(),
+            ),
+            (
+                124,
+                b"/bin/sh\0-c\0codex app-server --remote-control\0".as_slice(),
+            ),
+            (125, b"/usr/bin/codex\0exec\0--help\0".as_slice()),
+        ] {
+            std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+            std::fs::write(proc_root.join(format!("{pid}/cmdline")), cmdline).unwrap();
+        }
+
+        assert_eq!(list_codex_app_server_pids(&proc_root), vec![123]);
+        std::fs::remove_dir_all(proc_root).unwrap();
+    }
+
+    #[test]
+    fn desktop_detection_only_checks_the_executable() {
+        let proc_root = fixture("desktop-pids");
+        for (pid, cmdline) in [
+            (
+                200,
+                b"/opt/codex-desktop/codex-desktop\0--flag\0".as_slice(),
+            ),
+            (
+                201,
+                b"/bin/sh\0-c\0/opt/codex-desktop/codex-desktop\0".as_slice(),
+            ),
+        ] {
+            std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+            std::fs::write(proc_root.join(format!("{pid}/cmdline")), cmdline).unwrap();
+        }
+
+        assert_eq!(list_codex_desktop_pids(&proc_root), vec![200]);
+        std::fs::remove_dir_all(proc_root).unwrap();
+    }
+
+    #[test]
+    fn missing_socket_and_process_are_not_reported_active() {
         let proc_root = fixture("missing");
         std::fs::write(
             proc_root.join("net/unix"),
             "Num RefCount Protocol Flags Type St Inode Path\n",
         )
         .unwrap();
-        assert_eq!(
-            find_socket_inode(Path::new("/missing.sock"), &proc_root).unwrap(),
-            None
-        );
+        let socket = proc_root.join("stale.sock");
+        std::fs::write(&socket, []).unwrap();
+
+        assert_eq!(find_socket_inode(&socket, &proc_root).unwrap(), None);
+        assert!(wait_for_remote_to_stop(&socket, &proc_root, &[999], Duration::ZERO).unwrap());
+        stop_remote_at(&socket, &proc_root).unwrap();
+        assert!(!socket.exists());
+        std::fs::remove_dir_all(proc_root).unwrap();
+    }
+
+    #[test]
+    fn wait_detects_a_socketless_app_server_process() {
+        let proc_root = fixture("wait-process");
+        std::fs::write(
+            proc_root.join("net/unix"),
+            "Num RefCount Protocol Flags Type St Inode Path\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(proc_root.join("321")).unwrap();
+        std::fs::write(
+            proc_root.join("321/cmdline"),
+            b"/usr/bin/codex\0app-server\0--remote-control\0",
+        )
+        .unwrap();
+
+        assert!(!wait_for_remote_to_stop(
+            Path::new("/missing.sock"),
+            &proc_root,
+            &[321],
+            Duration::ZERO
+        )
+        .unwrap());
         std::fs::remove_dir_all(proc_root).unwrap();
     }
 }

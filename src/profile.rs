@@ -1,56 +1,5 @@
 use crate::data::{read_auth, Context};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fs;
-
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ProfileTransfers {
-    #[serde(default)]
-    pub codex_to_pi: BTreeMap<String, String>,
-}
-
-pub fn load_profile_transfers(ctx: &Context) -> ProfileTransfers {
-    let path = ctx.profile_transfers_path();
-    let Ok(content) = fs::read_to_string(&path) else {
-        return ProfileTransfers::default();
-    };
-    match serde_json::from_str(&content) {
-        Ok(transfers) => transfers,
-        Err(error) => crate::data::die(&format!(
-            "invalid profile transfer config {}: {}",
-            path.display(),
-            error
-        )),
-    }
-}
-
-pub fn remember_codex_to_pi_transfer(ctx: &Context, codex_name: &str, pi_name: &str) {
-    let mut transfers = load_profile_transfers(ctx);
-    transfers
-        .codex_to_pi
-        .insert(codex_name.to_string(), pi_name.to_string());
-    let path = ctx.profile_transfers_path();
-    if let Err(error) = fs::create_dir_all(&ctx.state_dir) {
-        crate::data::die(&format!(
-            "failed to create state directory {}: {}",
-            ctx.state_dir.display(),
-            error
-        ));
-    }
-    let content = match serde_json::to_string_pretty(&transfers) {
-        Ok(content) => content,
-        Err(error) => {
-            crate::data::die(&format!("failed to serialize profile transfers: {}", error))
-        }
-    };
-    if let Err(error) = fs::write(&path, format!("{}\n", content)) {
-        crate::data::die(&format!(
-            "failed to save profile transfer config {}: {}",
-            path.display(),
-            error
-        ));
-    }
-}
 
 /// List all profile paths, filtering out `bak-*` and empty names.
 pub fn list_profiles(ctx: &Context) -> Vec<std::path::PathBuf> {
@@ -111,6 +60,38 @@ pub fn profile_name(path: &std::path::Path) -> String {
         .to_string()
 }
 
+pub fn remove_profile(
+    ctx: &Context,
+    store: &str,
+    name: &str,
+) -> Result<std::path::PathBuf, String> {
+    crate::switch::validate_profile_name(name)?;
+    let path = match store {
+        "codex" => ctx.profile_path(name),
+        "pi" => ctx.pi_profile_path(name),
+        _ => {
+            return Err(format!(
+                "profile store must be `codex` or `pi`, got `{}`",
+                store
+            ))
+        }
+    };
+
+    std::fs::remove_file(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("saved {} profile `{}` does not exist", store, name)
+        } else {
+            format!(
+                "failed to remove saved {} profile {}: {}",
+                store,
+                path.display(),
+                error
+            )
+        }
+    })?;
+    Ok(path)
+}
+
 /// Detect which profile matches the current live auth.json by account_id (primary) or email (fallback).
 pub fn detect_current_profile(ctx: &Context) -> Option<String> {
     let live = read_auth(&ctx.live_auth);
@@ -150,8 +131,7 @@ pub fn detect_current_profile(ctx: &Context) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_current_profile, list_pi_profiles, list_profiles, load_profile_transfers,
-        profile_name, remember_codex_to_pi_transfer,
+        detect_current_profile, list_pi_profiles, list_profiles, profile_name, remove_profile,
     };
     use crate::data::Context;
     use std::path::PathBuf;
@@ -198,22 +178,27 @@ mod tests {
     }
 
     #[test]
-    fn remembers_codex_to_pi_transfers_by_source_profile() {
-        let (ctx, base) = context("transfers");
-        assert!(load_profile_transfers(&ctx).codex_to_pi.is_empty());
+    fn removes_profile_from_selected_store_only() {
+        let (ctx, base) = context("remove");
+        std::fs::create_dir_all(ctx.codex_profiles_dir()).unwrap();
+        std::fs::create_dir_all(ctx.pi_profiles_dir()).unwrap();
+        std::fs::write(ctx.profile_path("me"), "codex").unwrap();
+        std::fs::write(ctx.pi_profile_path("me"), "pi").unwrap();
 
-        remember_codex_to_pi_transfer(&ctx, "mate", "mate");
-        remember_codex_to_pi_transfer(&ctx, "work", "work-pi");
+        assert_eq!(
+            remove_profile(&ctx, "pi", "me").unwrap(),
+            ctx.pi_profile_path("me")
+        );
+        assert!(ctx.profile_path("me").exists());
+        assert!(!ctx.pi_profile_path("me").exists());
+        assert!(remove_profile(&ctx, "pi", "me").is_err());
+        std::fs::create_dir(ctx.pi_profile_path("blocked")).unwrap();
+        assert!(remove_profile(&ctx, "pi", "blocked")
+            .unwrap_err()
+            .contains("failed to remove saved pi profile"));
+        assert!(remove_profile(&ctx, "other", "me").is_err());
+        assert!(remove_profile(&ctx, "codex", "bad/name").is_err());
 
-        let transfers = load_profile_transfers(&ctx);
-        assert_eq!(
-            transfers.codex_to_pi.get("mate").map(String::as_str),
-            Some("mate")
-        );
-        assert_eq!(
-            transfers.codex_to_pi.get("work").map(String::as_str),
-            Some("work-pi")
-        );
         std::fs::remove_dir_all(base).unwrap();
     }
 

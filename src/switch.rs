@@ -1,9 +1,6 @@
 use crate::data::{read_auth, read_pi_auth, Context, PiAuthFile, PiOpenAiCodexAuth};
 use crate::jwt::{decode_token_payload, extract_email_from_token};
-use crate::profile::{
-    detect_current_profile, list_pi_profiles, load_profile_transfers, profile_name,
-    remember_codex_to_pi_transfer,
-};
+use crate::profile::{detect_current_profile, list_pi_profiles, profile_name};
 use crate::status::show_status;
 use std::fs;
 use std::path::Path;
@@ -248,7 +245,7 @@ fn save_pi_profile_if_present(ctx: &Context, name: &str) {
     println!("Saved current PI auth into profile: {}", name);
 }
 
-fn validate_profile_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || !name
             .chars()
@@ -386,7 +383,7 @@ pub fn save_profile(ctx: &Context, store: &str, name: &str) {
             });
             save_pi_profile_if_present(ctx, name);
         }
-        _ => crate::data::die("save-profile STORE must be `codex` or `pi`"),
+        _ => crate::data::die("profile save STORE must be `codex` or `pi`"),
     }
 
     println!();
@@ -448,7 +445,8 @@ pub fn transfer_profile(ctx: &Context, source_ref: &str, target_ref: &str) {
             let auth = read_auth(&source);
             let entry = auth_to_pi_openai_codex(&auth);
             write_pi_profile_and_switch_live(ctx, target_name, &entry);
-            remember_codex_to_pi_transfer(ctx, source_name, target_name);
+            crate::profile_options::configure_transfer(ctx, source_name, target_name)
+                .unwrap_or_else(|error| crate::data::die(&error));
             println!(
                 "Remembered Codex-to-PI transfer for switches: {} -> {}",
                 source_name, target_name
@@ -459,7 +457,7 @@ pub fn transfer_profile(ctx: &Context, source_ref: &str, target_ref: &str) {
                 "cannot transfer pi -> codex: PI profiles do not contain the Codex id_token required for a valid Codex auth file",
             );
         }
-        _ => crate::data::die("transfer-profile stores must be `codex` or `pi`"),
+        _ => crate::data::die("profile transfer now stores must be `codex` or `pi`"),
     }
 
     println!(
@@ -499,10 +497,23 @@ pub fn restore_last(ctx: &Context) {
 }
 
 pub fn switch_profile(ctx: &Context, target: &str, force: bool, scope: SwitchScope) {
+    switch_profile_with_status(ctx, target, force, scope, true);
+}
+
+pub fn switch_profile_with_status(
+    ctx: &Context,
+    target: &str,
+    force: bool,
+    scope: SwitchScope,
+    show_after: bool,
+) {
     validate_profile_name(target).unwrap_or_else(|error| crate::data::die(&error));
     let target_path = ctx.profile_path(target);
     let remembered_pi_target = (scope == SwitchScope::Both)
-        .then(|| load_profile_transfers(ctx).codex_to_pi.get(target).cloned())
+        .then(|| {
+            crate::profile_options::transfer_target(ctx, target)
+                .unwrap_or_else(|error| crate::data::die(&error))
+        })
         .flatten();
     if let Some(pi_target) = remembered_pi_target.as_deref() {
         validate_profile_name(pi_target).unwrap_or_else(|error| crate::data::die(&error));
@@ -610,8 +621,10 @@ pub fn switch_profile(ctx: &Context, target: &str, force: bool, scope: SwitchSco
         );
     }
 
-    println!();
-    show_status(ctx, false, false);
+    if show_after {
+        println!();
+        show_status(ctx, false, false);
+    }
 }
 
 #[cfg(test)]
@@ -976,10 +989,9 @@ mod tests {
         let saved_pi = load_pi_openai_codex(&ctx.pi_profile_path("mate-pi"));
         assert_eq!(saved_pi.account_id.as_deref(), Some("acct-mate"));
         assert_eq!(
-            crate::profile::load_profile_transfers(&ctx)
-                .codex_to_pi
-                .get("mate")
-                .map(String::as_str),
+            crate::profile_options::transfer_target(&ctx, "mate")
+                .unwrap()
+                .as_deref(),
             Some("mate-pi")
         );
         assert_eq!(saved_pi.refresh.as_deref(), Some("refresh-token"));
@@ -1003,7 +1015,7 @@ mod tests {
             r#"{"openai-codex":{"type":"oauth","access":"pi-me","accountId":"acct-me"}}"#,
         )
         .unwrap();
-        crate::profile::remember_codex_to_pi_transfer(&ctx, "mate", "mate");
+        crate::profile_options::configure_transfer(&ctx, "mate", "mate").unwrap();
 
         switch_profile(&ctx, "mate", false, SwitchScope::Both);
 
