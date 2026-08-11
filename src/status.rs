@@ -282,8 +282,6 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
     println!("Saved Codex profiles:");
 
     let profiles = list_profiles(ctx);
-    let profile_options =
-        crate::profile_options::load(ctx).unwrap_or_else(|error| crate::data::die(&error));
     for p in &profiles {
         let name = profile_name(p);
         let marker = if current_profile.as_deref() == Some(&name) {
@@ -328,23 +326,16 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
         }
 
         let is_live = if is_live_profile { " [live]" } else { "" };
-        let transfer = profile_options
-            .profiles
-            .get(&name)
-            .and_then(|option| option.transfer.as_ref())
-            .filter(|transfer| transfer.enabled)
-            .map(|transfer| format!(" [transfer→pi:{}]", transfer.pi_profile))
-            .unwrap_or_default();
 
         if let Some(email) = email_column_for_profile(&name, &email) {
             println!(
-                "{} {:>8} {}  {}  {}  {}{}{}",
-                marker, name, email, account, mode, refresh, is_live, transfer
+                "{} {:>8} {}  {}  {}  {}{}",
+                marker, name, email, account, mode, refresh, is_live
             );
         } else {
             println!(
-                "{} {:>8} {}  {}  {}{}{}",
-                marker, name, account, mode, refresh, is_live, transfer
+                "{} {:>8} {}  {}  {}{}",
+                marker, name, account, mode, refresh, is_live
             );
         }
     }
