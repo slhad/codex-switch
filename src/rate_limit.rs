@@ -1,6 +1,6 @@
 use crate::data::{
-    read_auth, read_pi_auth, AuthFile, Context, CreditAmount, PiOpenAiCodexAuth, ResetAt,
-    UsageResponse, UsageWindow,
+    read_auth, read_pi_auth, AuthFile, Context, CreditAmount, PiOpenAiCodexAuth,
+    RateLimitResetCredits, ResetAt, UsageResponse, UsageWindow,
 };
 use crate::jwt::decode_token_payload;
 use chrono::{DateTime, Days, Local, TimeZone, Utc};
@@ -9,6 +9,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use std::path::Path;
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const TOKEN_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 
 pub fn fetch_rate_limit(ctx: &Context) -> Result<UsageResponse, String> {
@@ -32,11 +33,18 @@ pub fn fetch_rate_limit_for_auth_path_read_only(path: &Path) -> Result<UsageResp
     if response.status() == reqwest::StatusCode::FORBIDDEN {
         return Err("403 forbidden from usage API".to_string());
     }
-    response
+    let mut usage = response
         .error_for_status()
         .map_err(|e| format!("usage request failed: {}", e))?
         .json::<UsageResponse>()
-        .map_err(|e| format!("invalid usage response: {}", e))
+        .map_err(|e| format!("invalid usage response: {}", e))?;
+    hydrate_reset_credit_details(
+        &client,
+        auth.tokens.access_token.as_deref().unwrap_or_default(),
+        auth.tokens.account_id.as_deref(),
+        &mut usage,
+    );
+    Ok(usage)
 }
 
 pub fn fetch_rate_limit_for_auth_path(path: &Path) -> Result<(UsageResponse, AuthFile), String> {
@@ -63,11 +71,17 @@ pub fn fetch_rate_limit_for_auth_path(path: &Path) -> Result<(UsageResponse, Aut
         return Err("403 forbidden from usage API".to_string());
     }
 
-    let usage = response
+    let mut usage = response
         .error_for_status()
         .map_err(|e| format!("usage request failed: {}", e))?
         .json::<UsageResponse>()
         .map_err(|e| format!("invalid usage response: {}", e))?;
+    hydrate_reset_credit_details(
+        &client,
+        auth.tokens.access_token.as_deref().unwrap_or_default(),
+        auth.tokens.account_id.as_deref(),
+        &mut usage,
+    );
 
     Ok((usage, auth))
 }
@@ -100,11 +114,18 @@ pub fn fetch_pi_rate_limit_for_auth_read_only(
     if response.status() == reqwest::StatusCode::FORBIDDEN {
         return Err("403 forbidden from PI usage API".to_string());
     }
-    response
+    let mut usage = response
         .error_for_status()
         .map_err(|e| format!("usage request failed: {}", e))?
         .json::<UsageResponse>()
-        .map_err(|e| format!("invalid usage response: {}", e))
+        .map_err(|e| format!("invalid usage response: {}", e))?;
+    hydrate_reset_credit_details(
+        &client,
+        &auth.access,
+        auth.account_id.as_deref(),
+        &mut usage,
+    );
+    Ok(usage)
 }
 
 pub fn fetch_pi_rate_limit_for_path(
@@ -135,11 +156,17 @@ pub fn fetch_pi_rate_limit_for_path(
         return Err("403 forbidden from PI usage API".to_string());
     }
 
-    let usage = response
+    let mut usage = response
         .error_for_status()
         .map_err(|e| format!("usage request failed: {}", e))?
         .json::<UsageResponse>()
         .map_err(|e| format!("invalid usage response: {}", e))?;
+    hydrate_reset_credit_details(
+        &client,
+        &auth.access,
+        auth.account_id.as_deref(),
+        &mut usage,
+    );
 
     Ok((usage, auth))
 }
@@ -184,6 +211,25 @@ fn send_usage_request_with_token(
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<reqwest::blocking::Response, String> {
+    send_backend_get_with_token(client, USAGE_URL, access_token, account_id)
+        .map_err(|e| format!("usage request failed: {}", e))
+}
+
+fn send_reset_credits_request_with_token(
+    client: &Client,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<reqwest::blocking::Response, String> {
+    send_backend_get_with_token(client, RESET_CREDITS_URL, access_token, account_id)
+        .map_err(|e| format!("reset credits request failed: {}", e))
+}
+
+fn send_backend_get_with_token(
+    client: &Client,
+    url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<reqwest::blocking::Response, String> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(
@@ -192,14 +238,52 @@ fn send_usage_request_with_token(
             .map_err(|e| format!("invalid access token header: {}", e))?,
     );
 
-    let mut request = client.get(USAGE_URL).headers(headers);
+    let mut request = client.get(url).headers(headers);
     if let Some(account_id) = account_id {
         request = request.header("ChatGPT-Account-Id", account_id);
     }
 
-    request
-        .send()
-        .map_err(|e| format!("usage request failed: {}", e))
+    request.send().map_err(|e| e.to_string())
+}
+
+fn hydrate_reset_credit_details(
+    client: &Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    usage: &mut UsageResponse,
+) {
+    let available_count = usage
+        .rate_limit_reset_credits
+        .as_ref()
+        .and_then(|credits| credits.available_count)
+        .unwrap_or(0);
+    if available_count == 0 || access_token.is_empty() {
+        return;
+    }
+
+    let Ok(response) = send_reset_credits_request_with_token(client, access_token, account_id)
+    else {
+        return;
+    };
+    let Ok(response) = response.error_for_status() else {
+        return;
+    };
+    let Ok(details) = response.json::<RateLimitResetCredits>() else {
+        return;
+    };
+    merge_reset_credit_details(usage, details);
+}
+
+fn merge_reset_credit_details(usage: &mut UsageResponse, details: RateLimitResetCredits) {
+    let summary = usage
+        .rate_limit_reset_credits
+        .get_or_insert_with(Default::default);
+    summary.available_count = details.available_count.or(summary.available_count);
+    summary.applicable_available_count = details
+        .applicable_available_count
+        .or(summary.applicable_available_count);
+    summary.total_earned_count = details.total_earned_count.or(summary.total_earned_count);
+    summary.credits = details.credits;
 }
 
 fn refresh_auth_at_path(
@@ -428,10 +512,12 @@ pub fn parse_reset_at(value: Option<&ResetAt>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_client_id, needs_pi_refresh, needs_refresh, parse_reset_at, pi_client_id,
-        write_pi_auth_at_path_if_unchanged,
+        codex_client_id, merge_reset_credit_details, needs_pi_refresh, needs_refresh,
+        parse_reset_at, pi_client_id, write_pi_auth_at_path_if_unchanged,
     };
-    use crate::data::{AuthFile, Context, PiOpenAiCodexAuth, ResetAt, Tokens};
+    use crate::data::{
+        AuthFile, Context, PiOpenAiCodexAuth, RateLimitResetCredits, ResetAt, Tokens, UsageResponse,
+    };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
@@ -477,6 +563,26 @@ mod tests {
     fn parses_epoch_reset_timestamp() {
         let ts = parse_reset_at(Some(&ResetAt::Epoch(1_781_569_991)));
         assert_eq!(ts, Some(1_781_569_991));
+    }
+
+    #[test]
+    fn merges_reset_details_without_losing_applicable_count() {
+        let mut usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":0}}"#,
+        )
+        .unwrap();
+        let details: RateLimitResetCredits = serde_json::from_str(
+            r#"{"available_count":1,"total_earned_count":0,"credits":[{"status":"available","expires_at":"2026-08-12T18:09:35Z","title":"Full reset"}]}"#,
+        )
+        .unwrap();
+
+        merge_reset_credit_details(&mut usage, details);
+
+        let merged = usage.rate_limit_reset_credits.unwrap();
+        assert_eq!(merged.available_count, Some(1));
+        assert_eq!(merged.applicable_available_count, Some(0));
+        assert_eq!(merged.total_earned_count, Some(0));
+        assert_eq!(merged.credits.len(), 1);
     }
 
     #[test]

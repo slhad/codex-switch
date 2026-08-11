@@ -54,6 +54,7 @@ codex-switch link install
 codex-switch link uninstall
 
 codex-switch waybar print [--format FORMAT] [--tooltip-format FORMAT]
+    [--percent-left]
     [--waybar-hide-minutes-with-days BOOL]
     [--waybar-hide-hours-with-days BOOL]
 codex-switch waybar install
@@ -128,9 +129,9 @@ Service uninstall preserves profile policies.
 
 ## Waybar
 
-`waybar print` emits JSON with the active profile in `text` and saved profile details in `tooltip` and `alt`. `waybar install` adds or updates `custom/codex-usage` while preserving unrelated settings and writing a timestamped backup before editing. Generated configuration invokes `codex-switch waybar print`.
+`waybar print` emits JSON with the active profile in `text` and saved profile details in `tooltip` and `alt`. By default, personal subscriptions and Business/Enterprise monthly spend controls display the percentage used. Pass `--percent-left` to display the percentage remaining for every usage window; the output stays compact and does not add a `left` label. `waybar install` adds or updates `custom/codex-usage` while preserving unrelated settings and writing a timestamped backup before editing. Generated configuration invokes `codex-switch waybar print`.
 
-Format tokens include `{usage_block}`, `{usage_block_pango}`, `{icon}`, `{time_icon}`, `{5h_pct}`, `{7d_pct}`, `{monthly_used_pct}`, `{status}`, `{profile}`, `{provider}`, `{email}`, `{pct}`, `{reset}`, and `{win}`.
+Format tokens include `{usage_block}`, `{usage_block_pango}`, `{icon}`, `{time_icon}`, `{5h_pct}`, `{7d_pct}`, `{5h_used_pct}`, `{5h_remaining_pct}`, `{7d_used_pct}`, `{7d_remaining_pct}`, `{monthly_pct}`, `{monthly_used_pct}`, `{monthly_remaining_pct}`, `{available_resets}`, `{applicable_resets}`, `{reset_expiry}`, `{reset_expiry_at}`, `{status}`, `{profile}`, `{provider}`, `{email}`, `{pct}`, `{reset}`, and `{win}`. `{5h_pct}`, `{7d_pct}`, `{monthly_pct}`, and `{pct}` follow the selected percentage mode; explicitly named used/remaining tokens do not. The default tooltip lists each available reset credit and its expiration when the reset-credit API provides details.
 
 ## PI OAuth hot-reload extension
 

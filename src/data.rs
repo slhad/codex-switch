@@ -31,6 +31,8 @@ pub struct UsageResponse {
     pub spend_control: Option<SpendControl>,
     #[serde(default)]
     pub credits: Option<UsageCredits>,
+    #[serde(default)]
+    pub rate_limit_reset_credits: Option<RateLimitResetCredits>,
 }
 
 impl UsageResponse {
@@ -100,7 +102,7 @@ impl UsageRateLimit {
 
 #[cfg(test)]
 mod usage_tests {
-    use super::{CreditAmount, UsageResponse};
+    use super::{CreditAmount, RateLimitResetCredits, UsageResponse};
 
     #[test]
     fn identifies_weekly_only_primary_window() {
@@ -149,6 +151,29 @@ mod usage_tests {
         assert_eq!(usage.spend_control.as_ref().unwrap().reached, Some(false));
         assert_eq!(usage.credits.as_ref().unwrap().has_credits, Some(true));
         assert_eq!(CreditAmount::Number(12.5).as_f64(), Some(12.5));
+    }
+
+    #[test]
+    fn supports_reset_credit_summary_and_expiration_details() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":0}}"#,
+        )
+        .unwrap();
+        let summary = usage.rate_limit_reset_credits.unwrap();
+        assert_eq!(summary.available_count, Some(1));
+        assert_eq!(summary.applicable_available_count, Some(0));
+
+        let details: RateLimitResetCredits = serde_json::from_str(
+            r#"{"credits":[{"status":"available","granted_at":"2026-07-13T18:09:35Z","expires_at":"2026-08-12T18:09:35Z","title":"Full reset","description":"One free reset"}],"available_count":1,"total_earned_count":0}"#,
+        )
+        .unwrap();
+        assert_eq!(details.available_count, Some(1));
+        assert_eq!(details.credits.len(), 1);
+        assert_eq!(details.credits[0].status.as_deref(), Some("available"));
+        assert_eq!(
+            details.credits[0].expires_at.as_deref(),
+            Some("2026-08-12T18:09:35Z")
+        );
     }
 }
 
@@ -206,6 +231,32 @@ pub struct UsageCredits {
     pub unlimited: Option<bool>,
     #[serde(default)]
     pub overage_limit_reached: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct RateLimitResetCredits {
+    #[serde(default)]
+    pub available_count: Option<u64>,
+    #[serde(default)]
+    pub applicable_available_count: Option<u64>,
+    #[serde(default)]
+    pub total_earned_count: Option<u64>,
+    #[serde(default)]
+    pub credits: Vec<RateLimitResetCredit>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RateLimitResetCredit {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub granted_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

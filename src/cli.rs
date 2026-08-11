@@ -271,6 +271,9 @@ pub struct WaybarPrintArgs {
     pub format: Option<String>,
     #[arg(long)]
     pub tooltip_format: Option<String>,
+    /// Display remaining percentages instead of used percentages
+    #[arg(long)]
+    pub percent_left: bool,
     #[arg(long = "waybar-hide-minutes-with-days", default_value_t = true, action = clap::ArgAction::Set)]
     pub hide_minutes_with_days: bool,
     #[arg(long = "waybar-hide-hours-with-days", default_value_t = true, action = clap::ArgAction::Set)]
@@ -467,6 +470,7 @@ mod tests {
                 "{profile}",
                 "--tooltip-format",
                 "x",
+                "--percent-left",
                 "--waybar-hide-minutes-with-days",
                 "false",
                 "--waybar-hide-hours-with-days",
@@ -484,6 +488,28 @@ mod tests {
         for args in accepted {
             assert!(Cli::try_parse_from(&args).is_ok(), "rejected {args:?}");
         }
+    }
+
+    #[test]
+    fn parses_waybar_percent_left_mode() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "waybar", "print", "--percent-left"]).unwrap();
+        let Some(Command::Waybar(args)) = cli.command else {
+            panic!("expected waybar command");
+        };
+        let WaybarCommand::Print(args) = args.command else {
+            panic!("expected waybar print command");
+        };
+        assert!(args.percent_left);
+
+        let cli = Cli::try_parse_from(["codex-switch", "waybar", "print"]).unwrap();
+        let Some(Command::Waybar(args)) = cli.command else {
+            panic!("expected waybar command");
+        };
+        let WaybarCommand::Print(args) = args.command else {
+            panic!("expected waybar print command");
+        };
+        assert!(!args.percent_left);
     }
 
     #[test]

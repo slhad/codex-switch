@@ -154,6 +154,7 @@ fn dispatch(command: Option<Command>, profile: Option<ProfileName>, ctx: &data::
                 args.tooltip_format.as_deref(),
                 args.hide_minutes_with_days,
                 args.hide_hours_with_days,
+                args.percent_left,
             ),
             WaybarCommand::Install => waybar_config::install_waybar_config(),
         },

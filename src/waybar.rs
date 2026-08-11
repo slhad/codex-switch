@@ -5,10 +5,10 @@ use crate::jwt::{extract_email, extract_email_from_token};
 use crate::profile::{detect_current_profile, list_pi_profiles, list_profiles, profile_name};
 use crate::rate_limit::{
     fetch_pi_rate_limit, fetch_pi_rate_limit_for_path, fetch_rate_limit_for_auth_path,
-    format_credit_amount, parse_reset_at, summarize_reset, summarize_window,
+    format_credit_amount, format_duration_until, parse_reset_at, summarize_reset, summarize_window,
 };
 use crate::tracker::{load_tracker, save_tracker, update_monthly_usage, update_rate_limit};
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 
 const DEFAULT_FORMAT: &str = "{usage_block}";
@@ -41,6 +41,7 @@ pub fn print_waybar(
     tooltip_format: Option<&str>,
     hide_minutes_with_days: bool,
     hide_hours_with_days: bool,
+    percent_left: bool,
 ) {
     let entries = collect_profile_usage(ctx);
     let last_quota_hit = update_last_quota_hit(ctx, &entries);
@@ -54,6 +55,7 @@ pub fn print_waybar(
                 last_quota_hit.as_ref(),
                 hide_minutes_with_days,
                 hide_hours_with_days,
+                percent_left,
             )
         })
         .unwrap_or_else(|| "codex ?".to_string());
@@ -61,12 +63,21 @@ pub fn print_waybar(
     let class = class_for_percentage(percentage).to_string();
     let tooltip = if let Some(template) = tooltip_format {
         active
-            .map(|entry| format_entry(template, entry, last_quota_hit.as_ref()))
+            .map(|entry| {
+                format_entry_with_options(
+                    template,
+                    entry,
+                    last_quota_hit.as_ref(),
+                    false,
+                    false,
+                    percent_left,
+                )
+            })
             .unwrap_or_else(|| "No Codex profiles found".to_string())
     } else {
         format_tooltip(&entries, last_quota_hit.as_ref())
     };
-    let alt = format_alt(&entries, last_quota_hit.as_ref());
+    let alt = format_alt(&entries, last_quota_hit.as_ref(), percent_left);
 
     let output = WaybarOutput {
         text,
@@ -372,7 +383,7 @@ fn format_entry(
     entry: &ProfileUsage,
     last_hit: Option<&TrackedQuotaHit>,
 ) -> String {
-    format_entry_with_options(template, entry, last_hit, false, false)
+    format_entry_with_options(template, entry, last_hit, false, false, false)
 }
 
 fn format_entry_with_options(
@@ -381,18 +392,41 @@ fn format_entry_with_options(
     last_hit: Option<&TrackedQuotaHit>,
     hide_minutes_with_days: bool,
     hide_hours_with_days: bool,
+    percent_left: bool,
 ) -> String {
     let mut values = FormatValues::default();
     if let Ok(usage) = &entry.usage {
-        if let Some((used, reset_in, _)) = usage.five_hour_window().and_then(summarize_window) {
-            values.five_hour_pct = used;
-            values.five_hour_reset =
-                compact_reset(reset_in, hide_minutes_with_days, hide_hours_with_days);
+        if let Some(window) = usage.five_hour_window() {
+            if let Some((used, reset_in, _)) = summarize_window(window) {
+                values.five_hour_used_pct = used.clone();
+                values.five_hour_remaining_pct = window
+                    .used_percent
+                    .map(remaining_percentage)
+                    .unwrap_or_default();
+                values.five_hour_pct = if percent_left {
+                    values.five_hour_remaining_pct.clone()
+                } else {
+                    used
+                };
+                values.five_hour_reset =
+                    compact_reset(reset_in, hide_minutes_with_days, hide_hours_with_days);
+            }
         }
-        if let Some((used, reset_in, _)) = usage.weekly_window().and_then(summarize_window) {
-            values.seven_day_pct = used;
-            values.seven_day_reset =
-                compact_reset(reset_in, hide_minutes_with_days, hide_hours_with_days);
+        if let Some(window) = usage.weekly_window() {
+            if let Some((used, reset_in, _)) = summarize_window(window) {
+                values.seven_day_used_pct = used.clone();
+                values.seven_day_remaining_pct = window
+                    .used_percent
+                    .map(remaining_percentage)
+                    .unwrap_or_default();
+                values.seven_day_pct = if percent_left {
+                    values.seven_day_remaining_pct.clone()
+                } else {
+                    used
+                };
+                values.seven_day_reset =
+                    compact_reset(reset_in, hide_minutes_with_days, hide_hours_with_days);
+            }
         }
         if let Some(monthly) = usage.monthly_limit() {
             values.monthly_limit = format_credit_amount(monthly.limit.as_ref());
@@ -400,15 +434,37 @@ fn format_entry_with_options(
             values.monthly_remaining = format_credit_amount(monthly.remaining.as_ref());
             values.monthly_used_pct = monthly
                 .used_percent
-                .map(|value| format!("{}", value))
+                .or_else(|| monthly.remaining_percent.map(complement_percentage))
+                .map(format_percentage)
                 .unwrap_or_default();
             values.monthly_remaining_pct = monthly
                 .remaining_percent
-                .map(|value| format!("{}", value))
+                .or_else(|| monthly.used_percent.map(complement_percentage))
+                .map(format_percentage)
                 .unwrap_or_default();
+            values.monthly_pct = if percent_left {
+                values.monthly_remaining_pct.clone()
+            } else {
+                values.monthly_used_pct.clone()
+            };
             if let Some((reset_in, _)) = summarize_reset(monthly.reset_at.as_ref()) {
                 values.monthly_reset =
                     compact_reset(reset_in, hide_minutes_with_days, hide_hours_with_days);
+            }
+        }
+        if let Some(reset_credits) = usage.rate_limit_reset_credits.as_ref() {
+            values.available_resets = reset_credits
+                .available_count
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            values.applicable_resets = reset_credits
+                .applicable_available_count
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            if let Some((reset_in, reset_at)) = earliest_reset_credit_expiry(reset_credits) {
+                values.reset_expiry =
+                    compact_reset(reset_in, hide_minutes_with_days, hide_hours_with_days);
+                values.reset_expiry_at = reset_at;
             }
         }
     }
@@ -423,15 +479,33 @@ fn format_entry_with_options(
     values.email = entry.email.clone();
     apply_last_hit(&mut values, last_hit);
     if values.monthly_limit.is_empty() {
-        values.window = "5h".to_string();
-        values.percent = values.five_hour_pct.clone();
-        values.reset = values.five_hour_reset.clone();
+        if values.five_hour_pct.is_empty() {
+            values.window = "7d".to_string();
+            values.percent = values.seven_day_pct.clone();
+            values.reset = values.seven_day_reset.clone();
+        } else {
+            values.window = "5h".to_string();
+            values.percent = values.five_hour_pct.clone();
+            values.reset = values.five_hour_reset.clone();
+        }
     } else {
         values.window = "month".to_string();
-        values.percent = values.monthly_used_pct.clone();
+        values.percent = values.monthly_pct.clone();
         values.reset = values.monthly_reset.clone();
     }
     values.apply(template)
+}
+
+fn format_percentage(value: f64) -> String {
+    format!("{}", value)
+}
+
+fn complement_percentage(value: f64) -> f64 {
+    (100.0 - value).clamp(0.0, 100.0)
+}
+
+fn remaining_percentage(used_percent: f64) -> String {
+    format_percentage(complement_percentage(used_percent))
 }
 
 fn compact_reset(
@@ -452,10 +526,42 @@ fn compact_reset(
         .join(" ")
 }
 
+fn format_reset_credit_expiry(expires_at: &str) -> Option<(u64, String, String)> {
+    let parsed = DateTime::parse_from_rfc3339(expires_at).ok()?;
+    let timestamp = u64::try_from(parsed.timestamp()).ok()?;
+    let duration = format_duration_until(timestamp);
+    let local = parsed
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string();
+    Some((timestamp, duration, local))
+}
+
+fn earliest_reset_credit_expiry(
+    reset_credits: &crate::data::RateLimitResetCredits,
+) -> Option<(String, String)> {
+    reset_credits
+        .credits
+        .iter()
+        .filter(|credit| credit.status.as_deref() == Some("available"))
+        .filter_map(|credit| {
+            credit
+                .expires_at
+                .as_deref()
+                .and_then(format_reset_credit_expiry)
+        })
+        .min_by_key(|(timestamp, _, _)| *timestamp)
+        .map(|(_, duration, local)| (duration, local))
+}
+
 #[derive(Default)]
 struct FormatValues {
     five_hour_pct: String,
+    five_hour_used_pct: String,
+    five_hour_remaining_pct: String,
     seven_day_pct: String,
+    seven_day_used_pct: String,
+    seven_day_remaining_pct: String,
     five_hour_reset: String,
     seven_day_reset: String,
     monthly_limit: String,
@@ -463,7 +569,12 @@ struct FormatValues {
     monthly_remaining: String,
     monthly_used_pct: String,
     monthly_remaining_pct: String,
+    monthly_pct: String,
     monthly_reset: String,
+    available_resets: String,
+    applicable_resets: String,
+    reset_expiry: String,
+    reset_expiry_at: String,
     status: String,
     profile: String,
     provider: String,
@@ -521,9 +632,9 @@ impl FormatValues {
             )
         } else {
             format!(
-                "{} {}% left {} {}",
+                "{} {}% {} {}",
                 ICON,
-                value_or_unknown(&self.monthly_remaining_pct),
+                value_or_unknown(&self.monthly_pct),
                 TIME_ICON,
                 value_or_unknown(&self.monthly_reset)
             )
@@ -539,9 +650,9 @@ impl FormatValues {
             )
         } else {
             format!(
-                "<span font_family=\"bootstrap-icons\" rise=\"1200\" color=\"#5f78ff\">{}</span> {}% left <span color=\"#5f78ff\">{}</span> {}",
+                "<span font_family=\"bootstrap-icons\" rise=\"1200\" color=\"#5f78ff\">{}</span> {}% <span color=\"#5f78ff\">{}</span> {}",
                 ICON,
-                value_or_unknown(&self.monthly_remaining_pct),
+                value_or_unknown(&self.monthly_pct),
                 TIME_ICON,
                 value_or_unknown(&self.monthly_reset)
             )
@@ -557,7 +668,17 @@ impl FormatValues {
             .replace("{time_icon}", TIME_ICON)
             .replace("{time_icon_plain}", TIME_ICON)
             .replace("{5h_pct}", value_or_unknown(&self.five_hour_pct))
+            .replace("{5h_used_pct}", value_or_unknown(&self.five_hour_used_pct))
+            .replace(
+                "{5h_remaining_pct}",
+                value_or_unknown(&self.five_hour_remaining_pct),
+            )
             .replace("{7d_pct}", value_or_unknown(&self.seven_day_pct))
+            .replace("{7d_used_pct}", value_or_unknown(&self.seven_day_used_pct))
+            .replace(
+                "{7d_remaining_pct}",
+                value_or_unknown(&self.seven_day_remaining_pct),
+            )
             .replace("{5h_reset}", value_or_unknown(&self.five_hour_reset))
             .replace("{7d_reset}", value_or_unknown(&self.seven_day_reset))
             .replace("{monthly_limit}", value_or_unknown(&self.monthly_limit))
@@ -574,7 +695,18 @@ impl FormatValues {
                 "{monthly_remaining_pct}",
                 value_or_unknown(&self.monthly_remaining_pct),
             )
+            .replace("{monthly_pct}", value_or_unknown(&self.monthly_pct))
             .replace("{monthly_reset}", value_or_unknown(&self.monthly_reset))
+            .replace(
+                "{available_resets}",
+                value_or_unknown(&self.available_resets),
+            )
+            .replace(
+                "{applicable_resets}",
+                value_or_unknown(&self.applicable_resets),
+            )
+            .replace("{reset_expiry}", value_or_unknown(&self.reset_expiry))
+            .replace("{reset_expiry_at}", value_or_unknown(&self.reset_expiry_at))
             .replace("{status}", &self.status)
             .replace("{profile}", &self.profile)
             .replace("{provider}", &self.provider)
@@ -605,16 +737,77 @@ fn value_or_unknown(value: &str) -> &str {
     }
 }
 
-fn format_tooltip(entries: &[ProfileUsage], last_hit: Option<&TrackedQuotaHit>) -> String {
-    if entries.is_empty() {
-        return "No Codex profiles found".to_string();
+fn same_usage_account(a: &ProfileUsage, b: &ProfileUsage) -> bool {
+    match (&a.account_id, &b.account_id) {
+        (Some(a_id), Some(b_id)) => a_id == b_id,
+        _ => a.email != "?" && a.email == b.email,
+    }
+}
+
+fn unique_usage_accounts(entries: &[ProfileUsage]) -> Vec<&ProfileUsage> {
+    let mut unique: Vec<&ProfileUsage> = Vec::new();
+    for entry in entries {
+        if let Some(existing) = unique
+            .iter_mut()
+            .find(|existing| same_usage_account(existing, entry))
+        {
+            if existing.usage.is_err() && entry.usage.is_ok() {
+                *existing = entry;
+            }
+        } else {
+            unique.push(entry);
+        }
+    }
+    unique
+}
+
+fn append_reset_credit_tooltip(lines: &mut Vec<String>, usage: &UsageResponse) {
+    let Some(reset_credits) = usage.rate_limit_reset_credits.as_ref() else {
+        return;
+    };
+    let available = reset_credits.available_count.unwrap_or(0);
+    if available == 0 {
+        return;
     }
 
-    let mut lines = vec!["Codex quotas".to_string()];
+    let applicable = reset_credits
+        .applicable_available_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    lines.push(format!(
+        "  Reset credits: {} available ({} currently applicable)",
+        available, applicable
+    ));
+
+    for credit in reset_credits
+        .credits
+        .iter()
+        .filter(|credit| credit.status.as_deref() == Some("available"))
+    {
+        let title = credit.title.as_deref().unwrap_or("Reset");
+        match credit
+            .expires_at
+            .as_deref()
+            .and_then(format_reset_credit_expiry)
+        {
+            Some((_, duration, local)) => lines.push(format!(
+                "    {}: expires in {} ({})",
+                title, duration, local
+            )),
+            None => lines.push(format!("    {}: expiration unavailable", title)),
+        }
+    }
+}
+
+fn format_tooltip(entries: &[ProfileUsage], last_hit: Option<&TrackedQuotaHit>) -> String {
+    if entries.is_empty() {
+        return "No accounts found".to_string();
+    }
+
+    let mut lines = vec!["Usage".to_string()];
     if let Some(hit) = last_hit {
         lines.push(format!(
-            "Last quota hit: {} {} ({}) {}% {} at {}",
-            hit.provider.as_deref().unwrap_or("?"),
+            "Last quota hit: {} ({}) {}% {} at {}",
             hit.profile.as_deref().unwrap_or("?"),
             hit.email.as_deref().unwrap_or("?"),
             hit.used_percent
@@ -624,13 +817,10 @@ fn format_tooltip(entries: &[ProfileUsage], last_hit: Option<&TrackedQuotaHit>) 
             hit.observed_at.as_deref().unwrap_or("?")
         ));
     }
-    for entry in entries {
-        let marker = if entry.is_live { "*" } else { "-" };
+    for entry in unique_usage_accounts(entries) {
         match &entry.usage {
             Ok(usage) if usage.monthly_limit().is_some() => lines.push(format!(
-                "{} {} {}: month {} / {} credits used ({}%) | {} credits left ({}%) | reset {} | limit reached {}",
-                marker,
-                entry.provider,
+                "{}: month {} / {} credits used ({}%) | {} credits left ({}%) | reset {} | limit reached {}",
                 entry.name,
                 format_entry("{monthly_used}", entry, last_hit),
                 format_entry("{monthly_limit}", entry, last_hit),
@@ -645,26 +835,37 @@ fn format_tooltip(entries: &[ProfileUsage], last_hit: Option<&TrackedQuotaHit>) 
                     .map(|value| if value { "yes" } else { "no" })
                     .unwrap_or("?"),
             )),
-            Ok(_) => lines.push(format!(
-                "{} {} {}: 5h {}% reset {} | 7d {}% reset {}",
-                marker,
-                entry.provider,
-                entry.name,
-                format_entry("{5h_pct}", entry, last_hit),
-                format_entry("{5h_reset}", entry, last_hit),
-                format_entry("{7d_pct}", entry, last_hit),
-                format_entry("{7d_reset}", entry, last_hit),
-            )),
-            Err(err) => lines.push(format!(
-                "{} {} {}: unavailable ({})",
-                marker, entry.provider, entry.name, err
-            )),
+            Ok(_) => {
+                let five_hour_pct = format_entry("{5h_pct}", entry, last_hit);
+                let five_hour_reset = format_entry("{5h_reset}", entry, last_hit);
+                let mut windows = Vec::new();
+                if five_hour_pct != "?" || five_hour_reset != "?" {
+                    windows.push(format!(
+                        "5h {}% reset {}",
+                        five_hour_pct, five_hour_reset
+                    ));
+                }
+                windows.push(format!(
+                    "7d {}% reset {}",
+                    format_entry("{7d_pct}", entry, last_hit),
+                    format_entry("{7d_reset}", entry, last_hit),
+                ));
+                lines.push(format!("{}: {}", entry.name, windows.join(" | ")));
+            }
+            Err(err) => lines.push(format!("{}: unavailable ({})", entry.name, err)),
+        }
+        if let Ok(usage) = &entry.usage {
+            append_reset_credit_tooltip(&mut lines, usage);
         }
     }
     lines.join("\n")
 }
 
-fn format_alt(entries: &[ProfileUsage], last_hit: Option<&TrackedQuotaHit>) -> String {
+fn format_alt(
+    entries: &[ProfileUsage],
+    last_hit: Option<&TrackedQuotaHit>,
+    percent_left: bool,
+) -> String {
     entries
         .iter()
         .map(|entry| {
@@ -672,9 +873,9 @@ fn format_alt(entries: &[ProfileUsage], last_hit: Option<&TrackedQuotaHit>) -> S
                 "{}:{}:{}:{}:{}",
                 entry.provider,
                 entry.name,
-                format_entry("{win}", entry, last_hit),
-                format_entry("{pct}", entry, last_hit),
-                format_entry("{reset}", entry, last_hit)
+                format_entry_with_options("{win}", entry, last_hit, false, false, percent_left),
+                format_entry_with_options("{pct}", entry, last_hit, false, false, percent_left),
+                format_entry_with_options("{reset}", entry, last_hit, false, false, percent_left)
             )
         })
         .collect::<Vec<_>>()
@@ -685,8 +886,8 @@ fn format_alt(entries: &[ProfileUsage], last_hit: Option<&TrackedQuotaHit>) -> S
 mod tests {
     use super::{
         apply_last_hit, class_for_percentage, compact_reset, display_entry, entry_percentage,
-        format_entry, format_tooltip, same_pi_account, FormatValues, ProfileUsage, DEFAULT_FORMAT,
-        ICON, TIME_ICON,
+        format_entry, format_entry_with_options, format_tooltip, same_pi_account, FormatValues,
+        ProfileUsage, DEFAULT_FORMAT, ICON, TIME_ICON,
     };
     use crate::data::{PiOpenAiCodexAuth, TrackedQuotaHit, UsageResponse};
 
@@ -711,6 +912,39 @@ mod tests {
             values.apply("{provider} {profile} {5h_pct}% {5h_reset} {7d_pct}% {7d_reset}"),
             "codex me 42% 1h 2m 12% 4d 3h 2m"
         );
+    }
+
+    #[test]
+    fn waybar_percent_left_mode_applies_to_subscription_windows() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_at":4102444800},"secondary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_at":4102444800}}}"#,
+        )
+        .unwrap();
+        let entry = ProfileUsage {
+            provider: "codex",
+            session_id: "codex:live".to_string(),
+            name: "me".to_string(),
+            email: "me@example.com".to_string(),
+            account_id: Some("acct-me".to_string()),
+            is_live: true,
+            usage: Ok(usage),
+        };
+
+        assert_eq!(
+            format_entry_with_options(
+                "{5h_pct}/{7d_pct} {5h_used_pct}/{5h_remaining_pct} {7d_used_pct}/{7d_remaining_pct} {pct}",
+                &entry,
+                None,
+                false,
+                false,
+                true,
+            ),
+            "58/88 42/58 12/88 58"
+        );
+        let text = format_entry_with_options(DEFAULT_FORMAT, &entry, None, false, false, true);
+        assert!(text.contains("58%"));
+        assert!(text.contains("88"));
+        assert!(!text.contains("left"));
     }
 
     #[test]
@@ -775,7 +1009,22 @@ mod tests {
         let entry = &entries[0];
 
         let text = format_entry(DEFAULT_FORMAT, entry, None);
-        assert!(text.contains(&format!("{} 99% left {}", ICON, TIME_ICON)));
+        assert!(text.contains(&format!("{} 1% {}", ICON, TIME_ICON)));
+        assert!(!text.contains("left"));
+        let left_text = format_entry_with_options(DEFAULT_FORMAT, entry, None, false, false, true);
+        assert!(left_text.contains(&format!("{} 99% {}", ICON, TIME_ICON)));
+        assert!(!left_text.contains("left"));
+        assert_eq!(
+            format_entry_with_options(
+                "{pct} {monthly_pct} {monthly_used_pct} {monthly_remaining_pct}",
+                entry,
+                None,
+                false,
+                false,
+                true,
+            ),
+            "99 99 1 99"
+        );
         assert_eq!(entry_percentage(entry), Some(1));
         assert_eq!(
             format_entry(
@@ -789,6 +1038,188 @@ mod tests {
         assert!(tooltip.contains("month 94.48 / 12500 credits used (1%)"));
         assert!(tooltip.contains("12405.52 credits left (99%)"));
         assert!(tooltip.contains("limit reached no"));
+    }
+
+    #[test]
+    fn waybar_formats_enterprise_used_and_remaining_percentages() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"plan_type":"enterprise","spend_control":{"individual_limit":{"remaining_percent":10,"reset_at":4102444800}}}"#,
+        )
+        .unwrap();
+        let entry = ProfileUsage {
+            provider: "codex",
+            session_id: "codex:live".to_string(),
+            name: "work".to_string(),
+            email: "person@example.com".to_string(),
+            account_id: Some("acct-work".to_string()),
+            is_live: true,
+            usage: Ok(usage),
+        };
+
+        let used = format_entry_with_options(DEFAULT_FORMAT, &entry, None, false, false, false);
+        let remaining = format_entry_with_options(DEFAULT_FORMAT, &entry, None, false, false, true);
+        assert!(used.contains(&format!("{} 90% {}", ICON, TIME_ICON)));
+        assert!(remaining.contains(&format!("{} 10% {}", ICON, TIME_ICON)));
+        assert!(!used.contains("left"));
+        assert!(!remaining.contains("left"));
+    }
+
+    #[test]
+    fn waybar_formats_available_resets_and_expiration() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit":{"primary_window":{"used_percent":5,"limit_window_seconds":604800,"reset_at":4102444800}},
+                "rate_limit_reset_credits":{
+                    "available_count":1,
+                    "applicable_available_count":0,
+                    "credits":[{
+                        "status":"available",
+                        "title":"Full reset",
+                        "expires_at":"2100-01-01T12:00:00Z"
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        let entries = vec![ProfileUsage {
+            provider: "codex",
+            session_id: "codex:live".to_string(),
+            name: "me".to_string(),
+            email: "me@example.com".to_string(),
+            account_id: Some("acct-me".to_string()),
+            is_live: true,
+            usage: Ok(usage),
+        }];
+        let entry = &entries[0];
+
+        let formatted = format_entry(
+            "{available_resets}/{applicable_resets} {reset_expiry} {reset_expiry_at}",
+            entry,
+            None,
+        );
+        assert!(formatted.starts_with("1/0 "));
+        assert!(formatted.contains("2100-01-01"));
+        assert!(!formatted.contains('?'));
+
+        let tooltip = format_tooltip(&entries, None);
+        assert!(tooltip.contains("Reset credits: 1 available (0 currently applicable)"));
+        assert!(tooltip.contains("Full reset: expires in"));
+        assert!(tooltip.contains("2100-01-01"));
+    }
+
+    #[test]
+    fn waybar_tooltip_deduplicates_accounts_without_app_names() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{
+                "plan_type":"business",
+                "rate_limit":null,
+                "spend_control":{"reached":false,"individual_limit":{
+                    "limit":"12500","used":"94.4807","remaining":"12405.5193",
+                    "used_percent":1,"remaining_percent":99,"reset_at":4102444800
+                }}
+            }"#,
+        )
+        .unwrap();
+        let entries = vec![
+            ProfileUsage {
+                provider: "codex",
+                session_id: "codex:live".to_string(),
+                name: "me".to_string(),
+                email: "me@example.com".to_string(),
+                account_id: Some("acct-me".to_string()),
+                is_live: true,
+                usage: Err("failed".to_string()),
+            },
+            ProfileUsage {
+                provider: "pi",
+                session_id: "pi:live".to_string(),
+                name: "me".to_string(),
+                email: "me@example.com".to_string(),
+                account_id: Some("acct-me".to_string()),
+                is_live: true,
+                usage: Ok(usage),
+            },
+            ProfileUsage {
+                provider: "codex",
+                session_id: "codex:profile:mate".to_string(),
+                name: "mate".to_string(),
+                email: "mate@example.com".to_string(),
+                account_id: None,
+                is_live: false,
+                usage: Err("unavailable".to_string()),
+            },
+            ProfileUsage {
+                provider: "pi",
+                session_id: "pi:profile:mate".to_string(),
+                name: "mate".to_string(),
+                email: "mate@example.com".to_string(),
+                account_id: None,
+                is_live: false,
+                usage: Err("unavailable".to_string()),
+            },
+        ];
+
+        let tooltip = format_tooltip(&entries, None);
+        assert!(tooltip.starts_with("Usage\n"));
+        assert_eq!(tooltip.matches("me:").count(), 1);
+        assert_eq!(tooltip.matches("mate:").count(), 1);
+        assert!(!tooltip.contains("codex "));
+        assert!(!tooltip.contains("pi "));
+        assert!(tooltip.contains("me: month 94.48 / 12500 credits used"));
+    }
+
+    #[test]
+    fn waybar_tooltip_hides_disabled_five_hour_window() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":8,"limit_window_seconds":604800,"reset_at":4102444800},"secondary_window":null}}"#,
+        )
+        .unwrap();
+        let entries = vec![ProfileUsage {
+            provider: "codex",
+            session_id: "codex:live".to_string(),
+            name: "me".to_string(),
+            email: "me@example.com".to_string(),
+            account_id: Some("acct-me".to_string()),
+            is_live: true,
+            usage: Ok(usage),
+        }];
+
+        let tooltip = format_tooltip(&entries, None);
+        assert!(!tooltip.contains("me: 5h"));
+        assert!(!tooltip.contains("| 5h"));
+        assert!(tooltip.contains("me: 7d 8% reset"));
+        assert_eq!(
+            format_entry_with_options("{win} {pct}", &entries[0], None, false, false, true),
+            "7d 92"
+        );
+    }
+
+    #[test]
+    fn waybar_tooltip_last_hit_omits_provider() {
+        let entries = vec![ProfileUsage {
+            provider: "codex",
+            session_id: "codex:live".to_string(),
+            name: "me".to_string(),
+            email: "me@example.com".to_string(),
+            account_id: Some("acct-me".to_string()),
+            is_live: true,
+            usage: Err("failed".to_string()),
+        }];
+        let hit = TrackedQuotaHit {
+            provider: Some("codex".to_string()),
+            profile: Some("me".to_string()),
+            email: Some("me@example.com".to_string()),
+            window: Some("7d".to_string()),
+            used_percent: Some(42.0),
+            observed_at: Some("2026-07-27T00:00:00Z".to_string()),
+            ..TrackedQuotaHit::default()
+        };
+
+        let tooltip = format_tooltip(&entries, Some(&hit));
+        assert!(
+            tooltip.contains("Last quota hit: me (me@example.com) 42% 7d at 2026-07-27T00:00:00Z")
+        );
+        assert!(!tooltip.contains("Last quota hit: codex"));
     }
 
     #[test]
