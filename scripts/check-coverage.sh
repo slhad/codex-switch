@@ -42,7 +42,7 @@ cargo +nightly test
 
 "$LLVM_PROFDATA" merge -sparse "$PROFRAW_DIR"/*.profraw -o "$PROFDATA"
 
-mapfile -t OBJECTS < <(find "$COVERAGE_TARGET_DIR/debug/deps" -maxdepth 1 -type f -perm -111 ! -name "*.so" | sort)
+mapfile -t OBJECTS < <(find "$COVERAGE_TARGET_DIR/debug" -type f -perm -111 -name "codex_switch-*" | sort)
 if [[ "${#OBJECTS[@]}" -eq 0 ]]; then
   echo "no coverage objects found" >&2
   exit 1
