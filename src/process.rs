@@ -31,8 +31,24 @@ fn list_matching_pids(proc_root: &Path, predicate: fn(&[String]) -> bool) -> Vec
 }
 
 fn is_codex_desktop(args: &[String]) -> bool {
-    args.first()
-        .is_some_and(|executable| executable.contains("/opt/codex-desktop/"))
+    let legacy_codex = args
+        .first()
+        .is_some_and(|executable| executable.contains("/opt/codex-desktop/"));
+    let chatgpt_main = args.first().is_some_and(|command| {
+        command.split_whitespace().next().is_some_and(|executable| {
+            Path::new(executable)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy() == "electron")
+        })
+    }) && !args
+        .iter()
+        .flat_map(|arg| arg.split_whitespace())
+        .any(|arg| arg.starts_with("--type="))
+        && args
+            .iter()
+            .flat_map(|arg| arg.split_whitespace())
+            .any(|arg| Path::new(arg).ends_with("chatgpt-desktop-bin/resources/app.asar"));
+    legacy_codex || chatgpt_main
 }
 
 fn list_codex_desktop_pids(proc_root: &Path) -> Vec<u32> {
@@ -47,11 +63,11 @@ pub fn kill_codex_desktop(_ctx: &Context) {
     let pids = list_codex_desktop_pids(Path::new("/proc"));
 
     if pids.is_empty() {
-        println!("No Codex desktop instances found.");
+        println!("No Codex or ChatGPT desktop instances found.");
         return;
     }
 
-    println!("Stopping Codex desktop processes:");
+    println!("Stopping Codex/ChatGPT desktop processes:");
     for pid in pids {
         println!("  pid {}", pid);
         let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
@@ -323,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_detection_only_checks_the_executable() {
+    fn desktop_detection_accepts_legacy_codex_and_chatgpt_main_only() {
         let proc_root = fixture("desktop-pids");
         for (pid, cmdline) in [
             (
@@ -334,12 +350,32 @@ mod tests {
                 201,
                 b"/bin/sh\0-c\0/opt/codex-desktop/codex-desktop\0".as_slice(),
             ),
+            (
+                202,
+                b"/usr/lib/electron42/electron\0--class=ChatGPT\0/usr/lib/chatgpt-desktop-bin/resources/app.asar\0".as_slice(),
+            ),
+            (
+                203,
+                b"/usr/lib/electron42/electron\0--type=renderer\0--app-path=/usr/lib/chatgpt-desktop-bin/resources/app.asar\0".as_slice(),
+            ),
+            (
+                204,
+                b"/usr/lib/electron42/electron\0--class=ChatGPT\0/usr/lib/other-app/resources/app.asar\0".as_slice(),
+            ),
+            (
+                205,
+                b"/usr/lib/electron42/electron --enable-sandbox --class=ChatGPT /usr/lib/chatgpt-desktop-bin/resources/app.asar\0".as_slice(),
+            ),
+            (
+                206,
+                b"/usr/lib/electron42/electron --type=renderer --app-path=/usr/lib/chatgpt-desktop-bin/resources/app.asar\0".as_slice(),
+            ),
         ] {
             std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
             std::fs::write(proc_root.join(format!("{pid}/cmdline")), cmdline).unwrap();
         }
 
-        assert_eq!(list_codex_desktop_pids(&proc_root), vec![200]);
+        assert_eq!(list_codex_desktop_pids(&proc_root), vec![200, 202, 205]);
         std::fs::remove_dir_all(proc_root).unwrap();
     }
 
