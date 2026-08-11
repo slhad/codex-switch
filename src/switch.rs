@@ -509,7 +509,7 @@ pub fn switch_profile_with_status(
 ) {
     validate_profile_name(target).unwrap_or_else(|error| crate::data::die(&error));
     let target_path = ctx.profile_path(target);
-    let remembered_pi_target = (scope == SwitchScope::Both)
+    let remembered_pi_target = (scope != SwitchScope::CodexOnly)
         .then(|| {
             crate::profile_options::transfer_target(ctx, target)
                 .unwrap_or_else(|error| crate::data::die(&error))
@@ -521,7 +521,7 @@ pub fn switch_profile_with_status(
     let pi_target_name = remembered_pi_target.as_deref().unwrap_or(target);
     let target_pi_path = ctx.pi_profile_path(pi_target_name);
     let should_switch_codex = scope != SwitchScope::PiOnly && target_path.exists();
-    let should_transfer_to_pi = remembered_pi_target.is_some() && should_switch_codex;
+    let should_transfer_to_pi = remembered_pi_target.is_some() && target_path.exists();
     let should_switch_pi =
         scope != SwitchScope::CodexOnly && (target_pi_path.exists() || should_transfer_to_pi);
 
@@ -540,7 +540,13 @@ pub fn switch_profile_with_status(
             }
         }
         SwitchScope::PiOnly => {
-            if !target_pi_path.exists() {
+            if remembered_pi_target.is_some() && !target_path.exists() {
+                crate::data::die(&format!(
+                    "missing Codex profile file for configured PI transfer: {}",
+                    target_path.display()
+                ));
+            }
+            if !target_pi_path.exists() && !should_transfer_to_pi {
                 crate::data::die(&format!(
                     "missing PI profile file: {}",
                     target_pi_path.display()
@@ -910,6 +916,29 @@ mod tests {
         );
         let live_pi = load_pi_openai_codex(&ctx.pi_auth);
         assert_eq!(live_pi.access, "pi-target");
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn switch_profile_pi_only_reproduces_enabled_codex_transfer() {
+        let (ctx, base) = test_context("switch-pi-only-transfer");
+        std::fs::create_dir_all(ctx.profile_path("mate").parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ctx.pi_auth.parent().unwrap()).unwrap();
+        let live = r#"{"tokens":{"id_token":"live","account_id":"acct-live"}}"#;
+        let mate = r#"{"tokens":{"id_token":"mate","access_token":"e30.eyJleHAiOjE3ODIwODQ2NzR9.sig","refresh_token":"mate-refresh","account_id":"acct-mate"}}"#;
+        std::fs::write(&ctx.live_auth, live).unwrap();
+        std::fs::write(ctx.profile_path("mate"), mate).unwrap();
+        std::fs::write(&ctx.pi_auth, r#"{"openai-codex":{"access":"pi-live"}}"#).unwrap();
+        crate::profile_options::configure_transfer(&ctx, "mate", "mate-pi").unwrap();
+
+        switch_profile(&ctx, "mate", false, SwitchScope::PiOnly);
+
+        assert_eq!(std::fs::read_to_string(&ctx.live_auth).unwrap(), live);
+        let live_pi = load_pi_openai_codex(&ctx.pi_auth);
+        assert_eq!(live_pi.account_id.as_deref(), Some("acct-mate"));
+        assert_eq!(live_pi.refresh.as_deref(), Some("mate-refresh"));
+        assert!(ctx.pi_profile_path("mate-pi").exists());
 
         std::fs::remove_dir_all(base).unwrap();
     }
