@@ -67,7 +67,7 @@ codex-switch completion bash
 codex-switch completion install [--force]
 ```
 
-`STORE` is `codex` or `pi`. The immediate `profile transfer now` operands use exact `STORE/PROFILE` references. On-switch mappings always transfer Codex to PI, so `set`, `enable`, and `disable` take bare profile names. `switch` defaults to `--target both`. `auto set` requires at least one setting and accepts multiple settings atomically. Plain `service logs` prints the journal and exits; `--follow` continues following it. Use `tracker list` to print every tracked session's exact `SESSION_ID` before removing one.
+`STORE` is `codex` or `pi`. The immediate `profile transfer now` operands use exact `STORE/PROFILE` references. On-switch mappings always transfer Codex to PI, so `set`, `enable`, and `disable` take bare profile names. Bare `codex-switch` lists every saved Codex profile in the `Profile options` section and shows its automatic-switch policy plus whether PI transfer is enabled, disabled, or not configured (`transfer none`). `switch` defaults to `--target both`. `auto set` requires at least one setting and accepts multiple settings atomically. Plain `service logs` prints the journal and exits; `--follow` continues following it. Use `tracker list` to print every tracked session's exact `SESSION_ID` before removing one.
 
 Examples:
 

@@ -1,6 +1,6 @@
 use crate::data::{read_pi_auth, Context, UsageResponse};
 use crate::jwt::extract_email_from_token;
-use crate::profile::{list_pi_profiles, profile_name};
+use crate::profile::{list_pi_profiles, list_profiles, profile_name};
 use crate::profile_options::ProfileOptions;
 use crate::rate_limit::{
     fetch_pi_rate_limit, fetch_pi_rate_limit_for_auth_read_only, fetch_pi_rate_limit_for_path,
@@ -141,26 +141,36 @@ fn profile_option_lines(options: &ProfileOptions) -> Vec<String> {
         .profiles
         .iter()
         .map(|(name, option)| {
-            let mut parts = Vec::new();
-            if let Some(policy) = option.auto.as_ref() {
-                parts.push(format!(
-                    "auto enabled={} priority={} codex={} pi={}",
-                    policy.enabled, policy.priority, policy.codex, policy.pi
-                ));
-            }
-            if let Some(transfer) = option.transfer.as_ref() {
-                parts.push(format!(
-                    "transfer enabled={} pi_profile={}",
-                    transfer.enabled, transfer.pi_profile
-                ));
-            }
-            format!("  {}: {}", name, parts.join("; "))
+            let auto = option
+                .auto
+                .as_ref()
+                .map(|policy| {
+                    format!(
+                        "auto enabled={} priority={} codex={} pi={}",
+                        policy.enabled, policy.priority, policy.codex, policy.pi
+                    )
+                })
+                .unwrap_or_else(|| "auto none".to_string());
+            let transfer = option
+                .transfer
+                .as_ref()
+                .map(|transfer| {
+                    format!(
+                        "transfer enabled={} pi_profile={}",
+                        transfer.enabled, transfer.pi_profile
+                    )
+                })
+                .unwrap_or_else(|| "transfer none".to_string());
+            format!("  {}: {}; {}", name, auto, transfer)
         })
         .collect()
 }
 
 pub fn print_profile_options(ctx: &Context) -> Result<(), String> {
-    let config = crate::profile_options::load(ctx)?;
+    let mut config = crate::profile_options::load(ctx)?;
+    for path in list_profiles(ctx) {
+        config.profiles.entry(profile_name(&path)).or_default();
+    }
     println!();
     println!("Profile options:");
     for line in profile_option_lines(&config) {
@@ -500,6 +510,9 @@ mod tests {
             vec!["  none"]
         );
         let mut config = ProfileOptions::default();
+        config
+            .profiles
+            .insert("empty".to_string(), ProfileOption::default());
         config.profiles.insert(
             "work".to_string(),
             ProfileOption {
@@ -517,7 +530,10 @@ mod tests {
         );
         assert_eq!(
             profile_option_lines(&config),
-            vec!["  work: auto enabled=true priority=100 codex=true pi=false; transfer enabled=false pi_profile=work-pi"]
+            vec![
+                "  empty: auto none; transfer none",
+                "  work: auto enabled=true priority=100 codex=true pi=false; transfer enabled=false pi_profile=work-pi",
+            ]
         );
     }
 
