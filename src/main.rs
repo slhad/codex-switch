@@ -12,6 +12,7 @@ mod status;
 mod storage;
 mod switch;
 mod systemd;
+mod t3_code;
 mod tracker;
 mod waybar;
 mod waybar_config;
@@ -88,6 +89,27 @@ fn dispatch(command: Option<Command>, profile: Option<ProfileName>, ctx: &data::
                     switch::import_profile(ctx, args.name.as_str(), &args.auth_json, args.force)
                 }
             },
+            ProfileCommand::ShadowHome(args) => {
+                let result = t3_code::bootstrap_shadow_home(
+                    ctx,
+                    args.profile.as_str(),
+                    args.path.as_deref(),
+                    args.force,
+                )
+                .unwrap_or_else(|error| data::die(&error));
+                println!(
+                    "T3 Code shadow home {}:\n  profile: {}\n  shared CODEX_HOME: {}\n  shadow home: {}\n  private auth: {}\n  tracked profile link: {}\nLive Codex auth was not changed: {}\n\nT3 Code provider settings:\n  Binary path: codex\n  CODEX_HOME path: {}\n  Shadow home path: {}",
+                    if result.changed { "created" } else { "already up to date" },
+                    args.profile.as_str(),
+                    result.shared_home.display(),
+                    result.shadow_home.display(),
+                    result.auth_path.display(),
+                    result.profile_path.display(),
+                    ctx.live_auth.display(),
+                    result.shared_home.display(),
+                    result.shadow_home.display(),
+                );
+            }
             ProfileCommand::Transfer(args) => match args.command {
                 ProfileTransferCommand::Now(args) => {
                     switch::transfer_profile(ctx, &args.source.compact(), &args.target.compact())

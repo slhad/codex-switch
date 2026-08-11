@@ -37,6 +37,7 @@ codex-switch stop [--remote-only]
 codex-switch profile save STORE NAME
 codex-switch profile remove STORE NAME
 codex-switch profile import codex NAME AUTH_JSON [--force]
+codex-switch profile shadow-home PROFILE [--path DIRECTORY] [--force]
 codex-switch profile transfer now SOURCE TARGET
 codex-switch profile transfer on-switch set SOURCE TARGET
 codex-switch profile transfer on-switch enable SOURCE
@@ -77,6 +78,7 @@ rtk cargo run -- status --debug all
 rtk cargo run -- switch work --target codex
 rtk cargo run -- profile save codex work
 rtk cargo run -- profile import codex work ./auth.json
+rtk cargo run -- profile shadow-home work
 rtk cargo run -- profile transfer now codex/work pi/work
 rtk cargo run -- profile transfer on-switch disable work
 rtk cargo run -- auto set work --priority 100 --pi false
@@ -85,6 +87,12 @@ rtk cargo run -- service logs
 rtk cargo run -- waybar print
 rtk cargo run -- storage
 ```
+
+## T3 Code shadow homes
+
+`profile shadow-home PROFILE` creates a T3 Code authentication overlay from a saved Codex profile. By default it writes the private account credential to `~/.codex-t3/PROFILE/auth.json`, links the saved profile to that private file so token refreshes and usage tracking remain synchronized, and prints the shared `CODEX_HOME` and shadow-home values to enter in T3 Code. It does not modify `~/.codex/auth.json`, so the currently active personal account remains unchanged while the T3 provider stays pinned to the selected profile.
+
+The command is idempotent when the shadow auth and saved-profile link already match. It refuses to replace a different `auth.json` without `--force`, rejects symlinked shadow auth files and saved profiles linked elsewhere, and preserves the saved profile's file permissions. Use `--path DIRECTORY` to choose another location. T3 Code materializes the shared session, plugin, skill, and configuration links when it starts the provider.
 
 ## Bash completion
 
