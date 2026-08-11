@@ -96,6 +96,8 @@ pub enum ProfileCommand {
     Save(ProfileStoreNameArgs),
     Remove(ProfileRemoveArgs),
     Import(ProfileImportArgs),
+    /// Create a T3 Code shadow home from a saved Codex profile
+    ShadowHome(ProfileShadowHomeArgs),
     Transfer(ProfileTransferArgs),
 }
 #[derive(Args, Debug)]
@@ -140,6 +142,23 @@ pub struct ProfileImportCodexArgs {
         add = clap_complete::ArgValueCompleter::new(clap_complete::PathCompleter::file())
     )]
     pub auth_json: PathBuf,
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ProfileShadowHomeArgs {
+    /// Saved Codex profile to install as the shadow home's private auth
+    #[arg(add = clap_complete::ArgValueCandidates::new(crate::completions::codex_profiles))]
+    pub profile: ProfileName,
+    /// Destination; defaults to ~/.codex-t3/PROFILE
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::DirPath,
+        add = clap_complete::ArgValueCompleter::new(clap_complete::PathCompleter::dir())
+    )]
+    pub path: Option<PathBuf>,
+    /// Replace a different existing shadow auth.json
     #[arg(long)]
     pub force: bool,
 }
@@ -409,6 +428,15 @@ mod tests {
             vec![
                 "codex-switch",
                 "profile",
+                "shadow-home",
+                "work",
+                "--path",
+                "/tmp/codex-work",
+                "--force",
+            ],
+            vec![
+                "codex-switch",
+                "profile",
                 "transfer",
                 "now",
                 "codex/work",
@@ -574,6 +602,7 @@ mod tests {
             (&["auto", "set"][..], "profile"),
             (&["auto", "remove"][..], "profile"),
             (&["profile", "remove"][..], "name"),
+            (&["profile", "shadow-home"][..], "profile"),
             (&["profile", "transfer", "now"][..], "source"),
             (&["profile", "transfer", "now"][..], "target"),
             (&["profile", "transfer", "on-switch", "set"][..], "source"),
