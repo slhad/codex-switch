@@ -25,8 +25,9 @@ Panel {
     ? accounts[selectedIndex] : null
   readonly property var selectedQuota: selectedAccount ? selectedAccount.quota : null
   readonly property string barText: usage.barTextValue
+  readonly property string barDetail: usage.barDetailValue
   readonly property string barTooltip: usage.barTooltipValue
-  readonly property bool alarming: usage.alarming(usage.activeAccount)
+  readonly property bool alarming: usage.alarming(usage.barAccount)
 
   function open() {
     usage.refresh()
@@ -171,9 +172,9 @@ Panel {
 
             iconComponent: Component {
               Text {
-                text: "󱚣"
+                text: "\uf915"
                 color: root.foreground
-                font.family: root.fontFamily
+                font.family: "bootstrap-icons"
                 font.pixelSize: Style.font.display
               }
             }
@@ -271,31 +272,45 @@ Panel {
                 width: parent.width
                 implicitHeight: sourceRow.implicitHeight + Style.space(4)
 
-                Row {
+                Item {
                   id: sourceRow
                   width: parent.width
-                  spacing: Style.space(8)
+                  height: Math.max(sourceLabel.implicitHeight, actionButton.implicitHeight)
+                  implicitHeight: height
 
                   Text {
+                    id: sourceLabel
+                    anchors.left: parent.left
+                    anchors.right: sourceStatus.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
                     text: String(modelData.provider || "").toUpperCase()
                       + " · " + String(modelData.profile || "?")
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     elide: Text.ElideRight
-                    width: parent.width * 0.50
                   }
 
                   Text {
+                    id: sourceStatus
+                    anchors.right: actionButton.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(72)
                     text: modelData.live === true ? "CURRENT" : String(modelData.status || "")
                     color: modelData.status === "ok" ? root.dim : Color.urgent
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
-                    width: parent.width * 0.20
                     horizontalAlignment: Text.AlignRight
+                    elide: Text.ElideLeft
                   }
 
                   Button {
+                    id: actionButton
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(72)
                     text: modelData.live === true ? "Current" : "Use"
                     enabled: modelData.switchable === true && !usage.switching && !usage.updating
                     bordered: true
@@ -400,23 +415,19 @@ Panel {
               }
             }
 
-            BorderSurface {
+            Column {
               visible: !!root.selectedQuota && !!root.selectedQuota.monthly
               width: parent.width
-              implicitHeight: monthlyColumn.implicitHeight + Style.space(18)
-              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.05)
-              borderSpec: Border.flat(Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15), 1)
-              radius: Style.cornerRadius
+              spacing: Style.space(6)
 
-              Column {
-                id: monthlyColumn
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.margins: Style.space(9)
-                spacing: Style.space(4)
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(monthlyLabel.implicitHeight, monthlyPercent.implicitHeight)
 
                 Text {
+                  id: monthlyLabel
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
                   text: "MONTHLY CREDITS"
                   color: root.foreground
                   font.family: root.fontFamily
@@ -425,38 +436,74 @@ Panel {
                 }
 
                 Text {
+                  id: monthlyPercent
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
                   text: {
                     var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
-                    return monthly ? String(monthly.used === null || monthly.used === undefined ? "?" : monthly.used)
-                      + " / " + String(monthly.limit === null || monthly.limit === undefined ? "?" : monthly.limit)
-                      + " used (" + usage.formatPercent(monthly.usedPercent) + ")" : ""
+                    return usage.formatPercent(usage.percentValue(monthly))
                   }
                   color: root.foreground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: Style.font.caption
                 }
+              }
 
-                Text {
-                  text: {
+              Rectangle {
+                width: parent.width
+                height: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
+                radius: height / 2
+                color: root.track
+
+                Rectangle {
+                  width: {
                     var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
-                    return monthly ? String(monthly.remaining === null || monthly.remaining === undefined ? "?" : monthly.remaining)
-                      + " credits left (" + usage.formatPercent(monthly.remainingPercent) + ")"
-                      + (monthly.reached === true ? " · limit reached" : "") : ""
+                    var value = usage.percentValue(monthly)
+                    return value === null
+                      ? 0 : parent.width * Math.max(0, Math.min(1, Number(value) / 100))
                   }
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  height: parent.height
+                  radius: parent.radius
+                  color: {
+                    var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
+                    return monthly && Number(monthly.usedPercent || 0) >= 90
+                      ? Color.urgent : root.foreground
+                  }
                 }
+              }
 
-                Text {
-                  visible: !!root.selectedQuota && !!root.selectedQuota.monthly
-                    && !!root.selectedQuota.monthly.resetAt
-                  text: root.selectedQuota && root.selectedQuota.monthly
-                    ? "Resets in " + usage.formatDuration(root.selectedQuota.monthly.resetAt) : ""
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+              Text {
+                text: {
+                  var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
+                  return monthly ? String(monthly.used === null || monthly.used === undefined ? "?" : monthly.used)
+                    + " / " + String(monthly.limit === null || monthly.limit === undefined ? "?" : monthly.limit)
+                    + " used (" + usage.formatPercent(monthly.usedPercent) + ")" : ""
                 }
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                text: {
+                  var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
+                  return monthly ? String(monthly.remaining === null || monthly.remaining === undefined ? "?" : monthly.remaining)
+                    + " credits left (" + usage.formatPercent(monthly.remainingPercent) + ")"
+                    + (monthly.reached === true ? " · limit reached" : "") : ""
+                }
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                visible: !!root.selectedQuota && !!root.selectedQuota.monthly
+                  && !!root.selectedQuota.monthly.resetAt
+                text: root.selectedQuota && root.selectedQuota.monthly
+                  ? "Resets in " + usage.formatDuration(root.selectedQuota.monthly.resetAt) : ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
             }
           }

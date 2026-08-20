@@ -24,9 +24,17 @@ Item {
     var revision = root.dataRevision
     return root.findActiveAccount()
   }
+  readonly property var barAccount: {
+    var revision = root.dataRevision
+    return root.findBarAccount()
+  }
   readonly property string barTextValue: {
     var revision = root.dataRevision
     return root.barText()
+  }
+  readonly property string barDetailValue: {
+    var revision = root.dataRevision
+    return root.barDetail()
   }
   readonly property string barTooltipValue: {
     var revision = root.dataRevision
@@ -147,6 +155,35 @@ Item {
     return accounts.length > 0 ? accounts[0] : null
   }
 
+  function findBarAccount() {
+    var hit = root.snapshot ? root.snapshot.lastQuotaHit : null
+    if (hit) {
+      var provider = String(hit.provider || "").toLowerCase()
+      var profile = String(hit.profile || "")
+      var email = String(hit.email || "").toLowerCase()
+
+      for (var i = 0; i < accounts.length; i++) {
+        var account = accounts[i]
+        var sources = account && Array.isArray(account.sources) ? account.sources : []
+        for (var j = 0; j < sources.length; j++) {
+          var source = sources[j]
+          if (provider !== "" && profile !== ""
+              && String(source.provider || "").toLowerCase() === provider
+              && String(source.profile || "") === profile)
+            return account
+        }
+      }
+
+      if (email !== "") {
+        for (var k = 0; k < accounts.length; k++) {
+          if (String(accounts[k].email || "").toLowerCase() === email)
+            return accounts[k]
+        }
+      }
+    }
+    return root.findActiveAccount()
+  }
+
   function quotaFor(account) {
     return account && account.quota ? account.quota : null
   }
@@ -209,14 +246,18 @@ Item {
     return window.kind + " " + percent + (reset === "" ? "" : " · " + reset)
   }
 
-  function barText() {
-    var account = activeAccount
-    if (!account) return "󱚣 ?"
+  function barDetail() {
+    var account = barAccount
+    if (!account) return "?"
     var window = headlineWindow(account)
-    if (!window) return "󱚣 ?"
+    if (!window) return "?"
     var reset = formatDuration(window.resetAt)
-    return "󱚣 " + formatPercent(percentValue(window))
+    return formatPercent(percentValue(window))
       + (reset === "" ? "" : " 󰥔 " + reset)
+  }
+
+  function barText() {
+    return "\uf915 " + root.barDetail()
   }
 
   function barTooltip() {
@@ -225,7 +266,7 @@ Item {
     var lines = ["Codex Switch"]
     for (var i = 0; i < accounts.length; i++) {
       var account = accounts[i]
-      var marker = account.current === true ? "* " : "- "
+      var marker = barAccount && account.key === barAccount.key ? "* " : "- "
       lines.push(marker + String(account.name || "?") + " · "
         + String(account.email || "?") + " · " + accountSummary(account))
     }
