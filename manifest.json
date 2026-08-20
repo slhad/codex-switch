@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.slhad.codex-switch",
+  "name": "Codex Switch",
+  "version": "0.1.0",
+  "author": "slhad",
+  "license": "MIT",
+  "description": "Multi-account Codex and PI quotas with explicit account switching in the Omarchy bar.",
+  "activation": "on-demand",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "omarchy/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Codex Switch",
+    "description": "Active-account quota summary with multi-account usage and switching.",
+    "category": "AI",
+    "aliases": ["codex", "codex-switch", "quotas"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 900,
+      "binaryPath": "codex-switch",
+      "percentMode": "used"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900
+      },
+      {
+        "key": "binaryPath",
+        "type": "path",
+        "label": "codex-switch binary",
+        "defaultValue": "codex-switch",
+        "description": "Command or absolute path used to collect quotas and switch profiles."
+      },
+      {
+        "key": "percentMode",
+        "type": "enum",
+        "label": "Bar percentage",
+        "options": ["used", "remaining"],
+        "defaultValue": "used"
+      }
+    ]
+  }
+}

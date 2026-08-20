@@ -4,6 +4,7 @@ mod completions;
 mod data;
 mod install;
 mod jwt;
+mod omarchy;
 mod process;
 mod profile;
 mod profile_options;
@@ -179,6 +180,9 @@ fn dispatch(command: Option<Command>, profile: Option<ProfileName>, ctx: &data::
                 args.percent_left,
             ),
             WaybarCommand::Install => waybar_config::install_waybar_config(),
+        },
+        Some(Command::Omarchy(args)) => match args.command {
+            OmarchyCommand::Print => omarchy::print_snapshot(ctx),
         },
         Some(Command::Tracker(args)) => match args.command {
             TrackerCommand::List => println!(

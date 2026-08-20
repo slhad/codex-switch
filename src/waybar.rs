@@ -16,14 +16,14 @@ const ICON: &str = "\u{F915}";
 const TIME_ICON: &str = "󰥔";
 
 #[derive(Debug)]
-struct ProfileUsage {
-    provider: &'static str,
-    session_id: String,
-    name: String,
-    email: String,
-    account_id: Option<String>,
-    is_live: bool,
-    usage: Result<UsageResponse, String>,
+pub(crate) struct ProfileUsage {
+    pub(crate) provider: &'static str,
+    pub(crate) session_id: String,
+    pub(crate) name: String,
+    pub(crate) email: String,
+    pub(crate) account_id: Option<String>,
+    pub(crate) is_live: bool,
+    pub(crate) usage: Result<UsageResponse, String>,
 }
 
 #[derive(Serialize)]
@@ -123,7 +123,7 @@ fn display_entry<'a>(
         .or_else(|| entries.first())
 }
 
-fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
+pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
     let mut entries = Vec::new();
     let live_bytes = std::fs::read(&ctx.live_auth).ok();
     let live_pi = read_pi_auth(&ctx.pi_auth).and_then(|auth| auth.openai_codex);
@@ -259,7 +259,10 @@ fn class_for_percentage(percentage: u8) -> &'static str {
     }
 }
 
-fn update_last_quota_hit(ctx: &Context, entries: &[ProfileUsage]) -> Option<TrackedQuotaHit> {
+pub(crate) fn update_last_quota_hit(
+    ctx: &Context,
+    entries: &[ProfileUsage],
+) -> Option<TrackedQuotaHit> {
     let mut tracker = load_tracker(ctx);
     let mut last_hit = tracker.last_quota_hit.clone();
     let observed_at = Utc::now().to_rfc3339();

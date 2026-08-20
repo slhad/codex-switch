@@ -59,6 +59,7 @@ codex-switch waybar print [--format FORMAT] [--tooltip-format FORMAT]
     [--waybar-hide-minutes-with-days BOOL]
     [--waybar-hide-hours-with-days BOOL]
 codex-switch waybar install
+codex-switch omarchy print
 
 codex-switch tracker list
 codex-switch tracker remove SESSION_ID
@@ -85,6 +86,7 @@ rtk cargo run -- auto set work --priority 100 --pi false
 rtk cargo run -- auto run --dry-run
 rtk cargo run -- service logs
 rtk cargo run -- waybar print
+rtk cargo run -- omarchy print
 rtk cargo run -- storage
 ```
 
@@ -134,6 +136,55 @@ CODEX_SWITCH_TIMER_INTERVAL=10min \
 ```
 
 Service uninstall preserves profile policies.
+
+## Omarchy Quattro plugin
+
+This repository also contains a Quickshell `bar-widget` plugin for Omarchy
+Quattro. It reads the structured output of `codex-switch omarchy print`, so
+OAuth files and usage API calls stay in Rust and tokens never enter QML.
+
+The plugin groups Codex and PI entries by account ID (falling back to email),
+shows the active account in the bar, and displays every account's 5-hour,
+7-day, monthly, and reset-credit details in its panel. Saved Codex and PI
+profiles can be switched explicitly from the panel.
+
+Build and install the binary first:
+
+```bash
+rtk cargo build --release
+target/release/codex-switch link install
+```
+
+Then install the repository as a Quattro plugin:
+
+```bash
+omarchy plugin add https://github.com/slhad/codex-switch.git --enable --yes
+omarchy bar move io.github.slhad.codex-switch --section right
+```
+
+The plugin manifest is at the repository root and the QML entrypoint is
+`omarchy/BarWidget.qml`. Configure it with `omarchy bar set` or directly in
+`~/.config/omarchy/shell.json`:
+
+```bash
+omarchy bar set io.github.slhad.codex-switch refreshIntervalSec 900 --json
+omarchy bar set io.github.slhad.codex-switch percentMode used
+```
+
+Validate it against the installed Quattro shell before enabling it:
+
+```bash
+omarchy plugin validate .
+qmllint -I "$OMARCHY_PATH/shell" omarchy/*.qml
+```
+
+If the built-in `omarchy.agents` widget is also enabled, disable its Codex
+provider to avoid a duplicate Codex indicator; it can remain enabled for
+other providers:
+
+```bash
+omarchy bar set omarchy.agents providers '{"codex":{"enabled":false}}' --json
+```
 
 ## Waybar
 

@@ -34,6 +34,8 @@ pub enum Command {
     Link(LinkArgs),
     /// Print or install Waybar integration
     Waybar(WaybarArgs),
+    /// Print structured usage data for the Omarchy Quickshell plugin
+    Omarchy(OmarchyArgs),
     /// Manage tracked sessions
     Tracker(TrackerArgs),
     /// Show storage paths
@@ -285,6 +287,17 @@ pub enum WaybarCommand {
     Install,
 }
 #[derive(Args, Debug)]
+pub struct OmarchyArgs {
+    #[command(subcommand)]
+    pub command: OmarchyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum OmarchyCommand {
+    Print,
+}
+
+#[derive(Args, Debug)]
 pub struct WaybarPrintArgs {
     #[arg(long)]
     pub format: Option<String>,
@@ -505,6 +518,7 @@ mod tests {
                 "false",
             ],
             vec!["codex-switch", "waybar", "install"],
+            vec!["codex-switch", "omarchy", "print"],
             vec!["codex-switch", "tracker", "list"],
             vec!["codex-switch", "tracker", "remove", "session"],
             vec!["codex-switch", "storage"],
