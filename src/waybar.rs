@@ -1,5 +1,5 @@
 use crate::data::{
-    read_auth, read_pi_auth, Context, PiOpenAiCodexAuth, TrackedQuotaHit, UsageResponse,
+    read_auth, read_pi_auth, AuthFile, Context, PiOpenAiCodexAuth, TrackedQuotaHit, UsageResponse,
 };
 use crate::jwt::{extract_email, extract_email_from_token};
 use crate::profile::{detect_current_profile, list_pi_profiles, list_profiles, profile_name};
@@ -126,18 +126,23 @@ fn display_entry<'a>(
 pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
     let mut entries = Vec::new();
     let live_bytes = std::fs::read(&ctx.live_auth).ok();
+    let live_auth = if ctx.live_auth.exists() {
+        std::panic::catch_unwind(|| read_auth(&ctx.live_auth)).ok()
+    } else {
+        None
+    };
     let live_pi = read_pi_auth(&ctx.pi_auth).and_then(|auth| auth.openai_codex);
 
     if ctx.live_auth.exists() {
         let current_profile = detect_current_profile(ctx).unwrap_or_else(|| "live".to_string());
         let usage = fetch_rate_limit_for_auth_path(&ctx.live_auth).map(|(usage, _)| usage);
-        let email = std::panic::catch_unwind(|| read_auth(&ctx.live_auth))
-            .ok()
-            .and_then(|auth| extract_email(&auth))
+        let email = live_auth
+            .as_ref()
+            .and_then(extract_email)
             .unwrap_or_else(|| "?".to_string());
-        let account_id = std::panic::catch_unwind(|| read_auth(&ctx.live_auth))
-            .ok()
-            .and_then(|auth| auth.tokens.account_id);
+        let account_id = live_auth
+            .as_ref()
+            .and_then(|auth| auth.tokens.account_id.clone());
         entries.push(ProfileUsage {
             provider: "codex",
             session_id: "codex:live".to_string(),
@@ -155,6 +160,13 @@ pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
         }
         let name = profile_name(&path);
         let auth = std::panic::catch_unwind(|| read_auth(&path)).ok();
+        if live_auth
+            .as_ref()
+            .zip(auth.as_ref())
+            .is_some_and(|(live, profile)| same_codex_account(live, profile))
+        {
+            continue;
+        }
         let email = auth
             .as_ref()
             .and_then(extract_email)
@@ -740,6 +752,21 @@ fn value_or_unknown(value: &str) -> &str {
     }
 }
 
+fn same_codex_account(a: &AuthFile, b: &AuthFile) -> bool {
+    match (
+        a.tokens.account_id.as_deref().filter(|id| !id.is_empty()),
+        b.tokens.account_id.as_deref().filter(|id| !id.is_empty()),
+    ) {
+        (Some(a_id), Some(b_id)) => return a_id == b_id,
+        _ => {}
+    }
+
+    match (extract_email(a), extract_email(b)) {
+        (Some(a_email), Some(b_email)) => a_email.eq_ignore_ascii_case(&b_email),
+        _ => false,
+    }
+}
+
 fn same_usage_account(a: &ProfileUsage, b: &ProfileUsage) -> bool {
     match (&a.account_id, &b.account_id) {
         (Some(a_id), Some(b_id)) => a_id == b_id,
@@ -889,10 +916,10 @@ fn format_alt(
 mod tests {
     use super::{
         apply_last_hit, class_for_percentage, compact_reset, display_entry, entry_percentage,
-        format_entry, format_entry_with_options, format_tooltip, same_pi_account, FormatValues,
-        ProfileUsage, DEFAULT_FORMAT, ICON, TIME_ICON,
+        format_entry, format_entry_with_options, format_tooltip, same_codex_account,
+        same_pi_account, FormatValues, ProfileUsage, DEFAULT_FORMAT, ICON, TIME_ICON,
     };
-    use crate::data::{PiOpenAiCodexAuth, TrackedQuotaHit, UsageResponse};
+    use crate::data::{AuthFile, PiOpenAiCodexAuth, Tokens, TrackedQuotaHit, UsageResponse};
 
     #[test]
     fn waybar_format_replaces_codex_usage_tokens() {
@@ -1253,6 +1280,39 @@ mod tests {
         };
 
         assert_eq!(display_entry(&entries, Some(&hit)).unwrap().name, "me");
+    }
+
+    #[test]
+    fn same_codex_account_matches_rotated_tokens_without_merging_accounts() {
+        let live = codex_auth(Some("acct-me"), "live-token");
+        let rotated = codex_auth(Some("acct-me"), "rotated-token");
+        let other = codex_auth(Some("acct-other"), "other-token");
+
+        assert!(same_codex_account(&live, &rotated));
+        assert!(!same_codex_account(&live, &other));
+    }
+
+    #[test]
+    fn same_codex_account_falls_back_to_case_insensitive_email() {
+        let live = codex_auth(None, "x.eyJlbWFpbCI6Im1lQGV4YW1wbGUuY29tIn0.x");
+        let profile = codex_auth(None, "x.eyJlbWFpbCI6Ik1lQGV4YW1wbGUuY29tIn0.x");
+        let other = codex_auth(None, "x.eyJlbWFpbCI6Im90aGVyQGV4YW1wbGUuY29tIn0.x");
+
+        assert!(same_codex_account(&live, &profile));
+        assert!(!same_codex_account(&live, &other));
+    }
+
+    fn codex_auth(account_id: Option<&str>, id_token: &str) -> AuthFile {
+        AuthFile {
+            tokens: Tokens {
+                id_token: id_token.to_string(),
+                access_token: None,
+                refresh_token: None,
+                account_id: account_id.map(str::to_string),
+            },
+            auth_mode: None,
+            last_refresh: None,
+        }
     }
 
     #[test]

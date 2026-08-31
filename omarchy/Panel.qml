@@ -37,6 +37,7 @@ Panel {
   }
 
   function close() {
+    if (usage.desktopSwitchPending) usage.cancelDesktopSwitch()
     root.controller.hide()
   }
 
@@ -126,6 +127,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: usage.desktopConfirmationOpen
 
       onMoveRequested: function(dx, dy) {
         if (dx !== 0) root.selectAccount(root.selectedIndex + dx)
@@ -140,6 +142,38 @@ Panel {
       onTextKey: function(text) {
         if (text === "r" || text === "R") usage.refresh()
         else if (text === "n" || text === "N") root.nextAccount()
+      }
+
+      ConfirmDialog {
+        id: desktopConfirm
+        anchors.fill: parent
+        z: 20
+        opened: usage.desktopConfirmationOpen
+        message: usage.desktopConfirmationMessage
+        confirmText: "Kill & switch"
+        background: Color.background
+        foreground: root.foreground
+        scrim: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.7)
+        selectedBackground: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+        selectedText: Color.accent
+        fontFamily: root.fontFamily
+        cornerRadius: Style.cornerRadius
+        focus: opened
+
+        Keys.priority: Keys.BeforeItem
+        Keys.onPressed: function(event) {
+          if (desktopConfirm.handleKey(event)) event.accepted = true
+        }
+
+        onOpenedChanged: if (opened) forceActiveFocus()
+        onCanceled: {
+          usage.cancelDesktopSwitch()
+          Qt.callLater(keyCatcher.forceActiveFocus)
+        }
+        onConfirmed: {
+          usage.confirmDesktopSwitch()
+          Qt.callLater(keyCatcher.forceActiveFocus)
+        }
       }
 
       Flickable {
@@ -298,6 +332,7 @@ Panel {
                   Button {
                     text: modelData.live === true ? "Current" : "Use"
                     enabled: modelData.switchable === true && !usage.switching && !usage.updating
+                      && !usage.desktopSwitchPending
                     bordered: true
                     foreground: root.foreground
                     fontFamily: root.fontFamily

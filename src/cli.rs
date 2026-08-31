@@ -295,6 +295,53 @@ pub struct OmarchyArgs {
 #[derive(Subcommand, Debug)]
 pub enum OmarchyCommand {
     Print,
+    /// Report whether the Codex desktop app is running
+    DesktopStatus,
+    /// Install the Omarchy Quickshell plugin from git or a local directory
+    Install(OmarchyPluginInstallArgs),
+    /// Update the Omarchy Quickshell plugin from git or a local directory
+    Update(OmarchyPluginUpdateArgs),
+}
+
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("plugin_source").required(true).args(["source", "git", "local"])))]
+pub struct OmarchyPluginSourceArgs {
+    /// Git URL or an existing local plugin directory (native-style shorthand)
+    #[arg(value_name = "SOURCE", conflicts_with_all = ["git", "local"])]
+    pub source: Option<String>,
+    /// Git repository URL
+    #[arg(long, value_name = "URL", conflicts_with_all = ["source", "local"])]
+    pub git: Option<String>,
+    /// Local plugin directory; omit the value to use the current directory
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        conflicts_with_all = ["source", "git"]
+    )]
+    pub local: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct OmarchyPluginInstallArgs {
+    #[command(flatten)]
+    pub source: OmarchyPluginSourceArgs,
+    /// Enable the plugin after installation
+    #[arg(long)]
+    pub enable: bool,
+    /// Skip the unsandboxed-plugin confirmation
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct OmarchyPluginUpdateArgs {
+    #[command(flatten)]
+    pub source: OmarchyPluginSourceArgs,
+    /// Skip the unsandboxed-plugin confirmation
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -519,6 +566,34 @@ mod tests {
             ],
             vec!["codex-switch", "waybar", "install"],
             vec!["codex-switch", "omarchy", "print"],
+            vec!["codex-switch", "omarchy", "desktop-status"],
+            vec![
+                "codex-switch",
+                "omarchy",
+                "install",
+                "--git",
+                "https://github.com/example/plugin.git",
+                "--enable",
+                "--yes",
+            ],
+            vec!["codex-switch", "omarchy", "install", "--local", "--yes"],
+            vec![
+                "codex-switch",
+                "omarchy",
+                "install",
+                "https://github.com/example/plugin.git",
+                "--yes",
+            ],
+            vec!["codex-switch", "omarchy", "update", "--local", ".", "--yes"],
+            vec!["codex-switch", "omarchy", "update", ".", "--yes"],
+            vec![
+                "codex-switch",
+                "omarchy",
+                "update",
+                "--git",
+                "https://github.com/example/plugin.git",
+                "--yes",
+            ],
             vec!["codex-switch", "tracker", "list"],
             vec!["codex-switch", "tracker", "remove", "session"],
             vec!["codex-switch", "storage"],
@@ -568,6 +643,19 @@ mod tests {
         let shorthand = Cli::try_parse_from(["codex-switch", "me"]).unwrap();
         assert!(shorthand.command.is_none());
         assert_eq!(shorthand.profile.unwrap().as_str(), "me");
+
+        let local = Cli::try_parse_from(["codex-switch", "omarchy", "install", "--local"]).unwrap();
+        let Some(Command::Omarchy(args)) = local.command else {
+            panic!("expected omarchy command");
+        };
+        let OmarchyCommand::Install(args) = args.command else {
+            panic!("expected plugin install command");
+        };
+        assert_eq!(
+            args.source.local.as_deref(),
+            Some(std::path::Path::new("."))
+        );
+        assert!(args.source.git.is_none());
 
         let reserved = Cli::try_parse_from(["codex-switch", "status"]).unwrap();
         assert!(matches!(reserved.command, Some(Command::Status(_))));
