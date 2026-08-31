@@ -601,7 +601,10 @@ mod tests {
     fn serializes_windows_monthly_limits_and_reset_credits() {
         let usage: UsageResponse = serde_json::from_value(serde_json::json!({
             "plan_type": "business",
-            "rate_limit": {"primary_window": {"used_percent": 20.0, "limit_window_seconds": 18000, "reset_at": 4102444800u64}},
+            "rate_limit": {
+                "primary_window": {"used_percent": 20.0, "limit_window_seconds": 18000, "reset_at": 4102444800u64},
+                "secondary_window": {"used_percent": 35.0, "limit_window_seconds": 604800, "reset_at": 4102444800u64}
+            },
             "spend_control": {"reached": false, "individual_limit": {
                 "limit": "12500", "used": "100", "remaining": "12400",
                 "used_percent": 1.0, "remaining_percent": 99.0, "reset_at": 4102444800u64
@@ -613,8 +616,12 @@ mod tests {
 
         let quota = quota_snapshot(&usage);
         assert_eq!(quota.plan_type.as_deref(), Some("business"));
+        assert_eq!(quota.windows.len(), 2);
         assert_eq!(quota.windows[0].kind, "5h");
         assert_eq!(quota.windows[0].remaining_percent, Some(80.0));
+        assert_eq!(quota.windows[1].kind, "7d");
+        assert_eq!(quota.windows[1].used_percent, Some(35.0));
+        assert_eq!(quota.windows[1].remaining_percent, Some(65.0));
         assert_eq!(quota.monthly.as_ref().unwrap().used, Some(100.0));
         assert_eq!(
             quota.reset_credits.as_ref().unwrap().available_count,

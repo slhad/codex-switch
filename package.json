@@ -2,17 +2,23 @@
   "name": "codex-switch-pi-extension",
   "version": "0.1.0",
   "private": true,
-  "description": "PI extension for hot-reloading OpenAI Codex OAuth profiles switched by codex-switch",
+  "type": "module",
+  "description": "PI and pi-acp account-scoped OpenAI Codex models backed by codex-switch profiles",
   "keywords": [
     "pi-package",
     "pi-extension",
+    "pi-acp",
     "codex",
-    "oauth"
+    "oauth",
+    "multi-account"
   ],
   "pi": {
     "extensions": [
-      "./extensions/codex-switch-auth-hot-reload.ts"
+      "./extensions/codex-switch-accounts.ts"
     ]
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types extensions/codex-switch-accounts.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

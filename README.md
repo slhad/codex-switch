@@ -60,6 +60,9 @@ codex-switch waybar print [--format FORMAT] [--tooltip-format FORMAT]
     [--waybar-hide-hours-with-days BOOL]
 codex-switch waybar install
 codex-switch omarchy print
+codex-switch omarchy desktop-status
+codex-switch omarchy install [SOURCE | --git URL | --local [DIRECTORY]] [--enable] [--yes]
+codex-switch omarchy update [SOURCE | --git URL | --local [DIRECTORY]] [--yes]
 
 codex-switch tracker list
 codex-switch tracker remove SESSION_ID
@@ -144,9 +147,12 @@ Quattro. It reads the structured output of `codex-switch omarchy print`, so
 OAuth files and usage API calls stay in Rust and tokens never enter QML.
 
 The plugin groups Codex and PI entries by account ID (falling back to email),
-shows the active account in the bar, and displays every account's 5-hour,
-7-day, monthly, and reset-credit details in its panel. Saved Codex and PI
-profiles can be switched explicitly from the panel.
+shows both available 5-hour and 7-day windows for the active account in the bar
+and tooltip, and displays every account's 5-hour, 7-day, monthly, and
+reset-credit details in its panel. Saved Codex and PI
+profiles can be switched explicitly from the panel. Before switching a Codex
+source, the plugin checks for a running Codex desktop app and asks whether it
+should terminate it before continuing.
 
 Build and install the binary first:
 
@@ -155,10 +161,35 @@ rtk cargo build --release
 target/release/codex-switch link install
 ```
 
-Then install the repository as a Quattro plugin:
+Then install the repository as a Quattro plugin. The native Omarchy command
+still works, or the codex-switch wrapper can install from git or copy the
+current local directory:
 
 ```bash
-omarchy plugin add https://github.com/slhad/codex-switch.git --enable --yes
+# From GitHub
+codex-switch omarchy install --git https://github.com/slhad/codex-switch.git --enable --yes
+
+# From the working tree (the path defaults to the current directory)
+codex-switch omarchy install --local . --enable --yes
+# Native-style shorthand also works: codex-switch omarchy install . --enable --yes
+```
+
+For later changes, update from either source. Updates validate the staged
+plugin, preserve the previous installation under
+`~/.config/omarchy/plugin-backups/`, and reload the Omarchy shell. Local
+updates are copied files rather than git checkouts, so use the local command
+again when you want to publish another working-tree change:
+
+```bash
+codex-switch omarchy update --local . --yes
+codex-switch omarchy update --git https://github.com/slhad/codex-switch.git --yes
+```
+
+The wrapper uses `omarchy plugin validate` before replacing anything and
+refuses non-interactive installs or updates unless `--yes` is supplied. Use
+`omarchy bar move` to choose the plugin's bar position:
+
+```bash
 omarchy bar move io.github.slhad.codex-switch --section right
 ```
 
@@ -192,23 +223,39 @@ omarchy bar set omarchy.agents providers '{"codex":{"enabled":false}}' --json
 
 Format tokens include `{usage_block}`, `{usage_block_pango}`, `{icon}`, `{time_icon}`, `{5h_pct}`, `{7d_pct}`, `{5h_used_pct}`, `{5h_remaining_pct}`, `{7d_used_pct}`, `{7d_remaining_pct}`, `{monthly_pct}`, `{monthly_used_pct}`, `{monthly_remaining_pct}`, `{available_resets}`, `{applicable_resets}`, `{reset_expiry}`, `{reset_expiry_at}`, `{status}`, `{profile}`, `{provider}`, `{email}`, `{pct}`, `{reset}`, and `{win}`. `{5h_pct}`, `{7d_pct}`, `{monthly_pct}`, and `{pct}` follow the selected percentage mode; explicitly named used/remaining tokens do not. The default tooltip lists each available reset credit and its expiration when the reset-credit API provides details.
 
-## PI OAuth hot-reload extension
+## PI and pi-acp account models
 
-This repository is also a PI package. Its extension wraps PI's public `openai-codex` provider authentication and reads the current OAuth credential from `~/.pi/agent/auth.json` whenever PI resolves request authentication. It changes only that provider and never logs access or refresh tokens.
+This repository is also a PI package. Its default extension discovers saved PI
+profiles under `~/.local/state/codex-switch/profiles/pi/` and registers one
+provider namespace per account. The models are exposed to PI and `pi-acp` as
+account-specific values such as:
 
-Install from this checkout and restart PI:
+```text
+codex-switch-work/gpt-5.3-codex
+codex-switch-personal/gpt-5.3-codex
+```
+
+The account provider reads and refreshes its own saved profile. Selecting one
+of these models does not overwrite the shared `~/.pi/agent/auth.json`, so
+separate PI/pi-acp sessions can select different accounts.
+
+Install from this checkout and restart PI or `pi-acp`:
 
 ```bash
 pi install /absolute/path/to/codex-switch
 ```
 
-Runtime controls:
+A profile must have a PI credential before it can be exposed as a model. For a
+Codex profile, create the PI transfer first:
 
-```text
-/codex-switch-auth-reload status
-/codex-switch-auth-reload off
-/codex-switch-auth-reload on
+```bash
+codex-switch profile transfer now codex/work pi/work
 ```
+
+The old `codex-switch-auth-hot-reload.ts` extension remains available for
+legacy single-account workflows that intentionally switch the shared
+`~/.pi/agent/auth.json`, but it is not loaded by this package by default and
+must not be loaded together with the account-model extension.
 
 ## Project structure
 

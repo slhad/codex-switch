@@ -5,6 +5,7 @@ mod data;
 mod install;
 mod jwt;
 mod omarchy;
+mod omarchy_plugin;
 mod process;
 mod profile;
 mod profile_options;
@@ -183,6 +184,22 @@ fn dispatch(command: Option<Command>, profile: Option<ProfileName>, ctx: &data::
         },
         Some(Command::Omarchy(args)) => match args.command {
             OmarchyCommand::Print => omarchy::print_snapshot(ctx),
+            OmarchyCommand::DesktopStatus => {
+                println!("{{\"running\":{}}}", process::codex_desktop_running())
+            }
+            OmarchyCommand::Install(args) => omarchy_plugin::install(
+                args.source.source.as_deref(),
+                args.source.git.as_deref(),
+                args.source.local.as_deref(),
+                args.enable,
+                args.yes,
+            ),
+            OmarchyCommand::Update(args) => omarchy_plugin::update(
+                args.source.source.as_deref(),
+                args.source.git.as_deref(),
+                args.source.local.as_deref(),
+                args.yes,
+            ),
         },
         Some(Command::Tracker(args)) => match args.command {
             TrackerCommand::List => println!(

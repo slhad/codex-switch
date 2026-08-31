@@ -59,6 +59,10 @@ fn list_codex_app_server_pids(proc_root: &Path) -> Vec<u32> {
     list_matching_pids(proc_root, is_codex_app_server)
 }
 
+pub fn codex_desktop_running() -> bool {
+    !list_codex_desktop_pids(Path::new("/proc")).is_empty()
+}
+
 pub fn kill_codex_desktop(_ctx: &Context) {
     let pids = list_codex_desktop_pids(Path::new("/proc"));
 
@@ -252,8 +256,9 @@ fn remove_stale_socket(socket: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        find_socket_inode, find_socket_owners, is_codex_app_server, list_codex_app_server_pids,
-        list_codex_desktop_pids, read_cmdline, stop_remote_at, wait_for_remote_to_stop,
+        codex_desktop_running, find_socket_inode, find_socket_owners, is_codex_app_server,
+        list_codex_app_server_pids, list_codex_desktop_pids, read_cmdline, stop_remote_at,
+        wait_for_remote_to_stop,
     };
     use std::os::unix::fs::symlink;
     use std::path::Path;
@@ -376,6 +381,7 @@ mod tests {
         }
 
         assert_eq!(list_codex_desktop_pids(&proc_root), vec![200, 202, 205]);
+        let _ = codex_desktop_running();
         std::fs::remove_dir_all(proc_root).unwrap();
     }
 

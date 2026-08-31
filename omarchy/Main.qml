@@ -2,9 +2,9 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// The Rust binary owns OAuth files and usage API calls. This item only starts
-// the collector, validates its display-only JSON, and keeps the last good
-// snapshot available while a refresh is running.
+// The Rust binary owns OAuth files, usage API calls, and process checks. This
+// item starts the collector, validates its display-only JSON, and keeps the
+// last good snapshot available while a refresh is running.
 Item {
   id: root
   visible: false
@@ -35,6 +35,15 @@ Item {
   }
   readonly property bool updating: updateProcess.running
   readonly property bool switching: switchProcess.running
+  readonly property bool desktopSwitchPending: pendingSource !== null
+    || desktopCheckProcess.running || desktopConfirmationOpen
+  readonly property string desktopConfirmationMessage: pendingSource
+    ? "Codex desktop is running. Kill it and switch to \""
+      + String(pendingSource.profile || "account") + "\"?" : ""
+  property var pendingSource: null
+  property bool desktopConfirmationOpen: false
+  property string desktopCheckError: ""
+  property bool desktopCheckHandled: false
   readonly property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 900)))
   readonly property string binaryPath: expandPath(String(setting("binaryPath", "codex-switch")))
   readonly property string percentMode: String(setting("percentMode", "used")).toLowerCase() === "remaining"
@@ -75,6 +84,32 @@ Item {
       if (root.pendingRefresh) {
         root.pendingRefresh = false
         Qt.callLater(root.refresh)
+      }
+    }
+  }
+
+  Process {
+    id: desktopCheckProcess
+    running: false
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyDesktopStatus(text)
+    }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim() !== "") root.desktopCheckError = text.trim()
+    }
+
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && !root.desktopCheckHandled) {
+        root.pendingSource = null
+        root.desktopConfirmationOpen = false
+        root.actionStatusText = ""
+        root.errorText = root.desktopCheckError !== ""
+          ? root.desktopCheckError
+          : "Could not check Codex desktop (status " + exitCode + ")"
       }
     }
   }
@@ -201,12 +236,35 @@ Item {
     return Math.max(1, minutes) + "m"
   }
 
+  function quotaWindowsSummary(account, separator) {
+    var quota = quotaFor(account)
+    if (!quota) return ""
+
+    var summaries = []
+    var windows = Array.isArray(quota.windows) ? quota.windows : []
+    for (var i = 0; i < windows.length; i++) {
+      var window = windows[i]
+      if (!window) continue
+      var summary = String(window.kind || "window") + " " + formatPercent(percentValue(window))
+      var reset = formatDuration(window.resetAt)
+      if (reset !== "") summary += " 󰥔 " + reset
+      summaries.push(summary)
+    }
+    return summaries.join(separator || " · ")
+  }
+
   function accountSummary(account) {
     var window = headlineWindow(account)
     if (!window) return account && account.status === "unavailable" ? "unavailable" : "?"
-    var percent = formatPercent(percentValue(window))
-    var reset = formatDuration(window.resetAt)
-    return window.kind + " " + percent + (reset === "" ? "" : " · " + reset)
+
+    if (window.kind === "month") {
+      var monthlyReset = formatDuration(window.resetAt)
+      return "month " + formatPercent(percentValue(window))
+        + (monthlyReset === "" ? "" : " · " + monthlyReset)
+    }
+
+    var summary = quotaWindowsSummary(account, " · ")
+    return summary === "" ? "?" : summary
   }
 
   function barText() {
@@ -214,9 +272,15 @@ Item {
     if (!account) return "󱚣 ?"
     var window = headlineWindow(account)
     if (!window) return "󱚣 ?"
-    var reset = formatDuration(window.resetAt)
-    return "󱚣 " + formatPercent(percentValue(window))
-      + (reset === "" ? "" : " 󰥔 " + reset)
+
+    if (window.kind === "month") {
+      var reset = formatDuration(window.resetAt)
+      return "󱚣 " + formatPercent(percentValue(window))
+        + (reset === "" ? "" : " 󰥔 " + reset)
+    }
+
+    var summary = quotaWindowsSummary(account, " · ")
+    return summary === "" ? "󱚣 ?" : "󱚣 " + summary
   }
 
   function barTooltip() {
@@ -238,20 +302,82 @@ Item {
     return !!window && Number(window.usedPercent) >= 90
   }
 
-  function switchSource(source) {
+  function startSwitch(source, killDesktop) {
     if (!source || source.switchable !== true || switchProcess.running || updateProcess.running)
       return false
     root.actionStatusText = "Switching to " + String(source.profile || "account") + "..."
     root.lastActionError = ""
-    switchProcess.command = [
+    var command = [
       root.binaryPath,
       "switch",
       String(source.profile || ""),
       "--target",
       String(source.provider || "")
     ]
+    if (killDesktop) command.push("--kill")
+    switchProcess.command = command
     switchProcess.running = true
     return true
+  }
+
+  function switchSource(source) {
+    if (!source || source.switchable !== true || switchProcess.running || updateProcess.running
+        || desktopCheckProcess.running || root.desktopConfirmationOpen)
+      return false
+
+    if (String(source.provider || "").toLowerCase() !== "codex")
+      return root.startSwitch(source, false)
+
+    root.pendingSource = source
+    root.desktopCheckHandled = false
+    root.desktopCheckError = ""
+    root.errorText = ""
+    root.actionStatusText = "Checking Codex desktop..."
+    desktopCheckProcess.command = [root.binaryPath, "omarchy", "desktop-status"]
+    desktopCheckProcess.running = true
+    return true
+  }
+
+  function applyDesktopStatus(content) {
+    root.desktopCheckHandled = true
+    try {
+      var parsed = JSON.parse(String(content || ""))
+      if (!parsed || typeof parsed.running !== "boolean")
+        throw new Error("invalid desktop status")
+
+      var source = root.pendingSource
+      if (!source) return
+      if (parsed.running === true) {
+        root.actionStatusText = ""
+        root.desktopConfirmationOpen = true
+        return
+      }
+
+      root.pendingSource = null
+      if (!root.startSwitch(source, false))
+        root.errorText = "Cannot switch while another action is running"
+    } catch (error) {
+      root.pendingSource = null
+      root.desktopConfirmationOpen = false
+      root.actionStatusText = ""
+      root.errorText = "Could not check Codex desktop: " + error
+    }
+  }
+
+  function confirmDesktopSwitch() {
+    var source = root.pendingSource
+    root.pendingSource = null
+    root.desktopConfirmationOpen = false
+    if (!root.startSwitch(source, true))
+      root.errorText = "Cannot switch while another action is running"
+  }
+
+  function cancelDesktopSwitch() {
+    root.desktopCheckHandled = true
+    if (desktopCheckProcess.running) desktopCheckProcess.running = false
+    root.desktopConfirmationOpen = false
+    root.pendingSource = null
+    root.actionStatusText = "Switch cancelled"
   }
 
   function resetCredits(account) {
