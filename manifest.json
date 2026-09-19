@@ -21,7 +21,10 @@
     "defaults": {
       "refreshIntervalSec": 900,
       "binaryPath": "codex-switch",
-      "percentMode": "used"
+      "percentMode": "used",
+      "hideEmails": false,
+      "autoHideEmailsWhenStreaming": false,
+      "streamingCheckIntervalSec": 10
     },
     "schema": [
       {
@@ -46,6 +49,30 @@
         "label": "Bar percentage",
         "options": ["used", "remaining"],
         "defaultValue": "used"
+      },
+      {
+        "key": "hideEmails",
+        "type": "boolean",
+        "label": "Hide account emails",
+        "defaultValue": false,
+        "description": "Hide account email addresses from the panel header and bar tooltip."
+      },
+      {
+        "key": "autoHideEmailsWhenStreaming",
+        "type": "boolean",
+        "label": "Auto-hide emails while streaming",
+        "defaultValue": false,
+        "description": "Hide account email addresses while OBS is running on Linux or through Wine."
+      },
+      {
+        "key": "streamingCheckIntervalSec",
+        "type": "integer",
+        "label": "Streaming check interval (seconds)",
+        "min": 5,
+        "max": 60,
+        "step": 5,
+        "defaultValue": 10,
+        "description": "How often to check for OBS when automatic hiding is enabled."
       }
     ]
   }

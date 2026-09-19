@@ -8,15 +8,16 @@ use crate::rate_limit::{
 };
 use crate::tracker::{
     fingerprint_secret, load_tracker, save_tracker, update_monthly_usage, update_rate_limit,
-    upsert_session,
+    update_usage_cache, upsert_session,
 };
+use crate::waybar::usage_or_cached;
 use chrono::{Local, TimeZone};
 
 /// Truncate account ID to 8 chars with "..." if longer.
 fn short_id(id: Option<&str>) -> String {
     match id {
         None => "?".to_string(),
-        Some(s) if s.is_empty() => "?".to_string(),
+        Some("") => "?".to_string(),
         Some(s) if s.len() <= 8 => s.to_string(),
         Some(s) => format!("{}...", &s[..8]),
     }
@@ -26,7 +27,7 @@ fn auth_access_exp(auth: &crate::data::AuthFile) -> Option<u64> {
     auth.tokens
         .access_token
         .as_deref()
-        .and_then(|token| decode_token_payload(token))
+        .and_then(decode_token_payload)
         .and_then(|payload| payload.exp)
         .map(|exp| exp * 1000)
 }
@@ -47,6 +48,7 @@ fn update_entry_rate_limit_from_usage(
     entry: &mut crate::data::TrackedSession,
     usage: &crate::data::UsageResponse,
 ) {
+    update_usage_cache(entry, usage);
     if let Some(monthly) = usage.monthly_limit() {
         update_monthly_usage(
             entry,
@@ -161,8 +163,17 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
         .as_ref()
         .and_then(|auth| auth.auth_mode.as_deref())
         .unwrap_or("?");
-    let latest_rate_limit = live.as_ref().map(|_| fetch_rate_limit(ctx));
     let mut tracker = load_tracker(ctx);
+    let latest_rate_limit = live.as_ref().map(|_| {
+        usage_or_cached(
+            fetch_rate_limit(ctx),
+            &tracker,
+            "codex:live",
+            live.as_ref()
+                .and_then(|auth| auth.tokens.account_id.as_deref()),
+            &live_email,
+        )
+    });
 
     if let Some((live, account_id)) = live.as_ref().and_then(|auth| {
         auth.tokens
@@ -180,12 +191,15 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
             Some(live_email.clone()),
             live.auth_mode.clone(),
             live.last_refresh.clone(),
-            auth_access_exp(&live),
+            auth_access_exp(live),
             live.tokens.refresh_token.is_some(),
             fingerprint_secret(live.tokens.refresh_token.as_deref()),
         );
 
-        if let Some(Ok(usage)) = latest_rate_limit.as_ref() {
+        if let Some(Ok(usage)) = latest_rate_limit
+            .as_ref()
+            .filter(|result| result.as_ref().is_ok_and(|usage| !usage.cached))
+        {
             update_entry_rate_limit_from_usage(entry, usage);
         }
     }
@@ -210,6 +224,12 @@ pub fn show_status(ctx: &Context, debug_usage: bool, debug_pi_usage: bool) {
     }
 
     if let Some(Ok(usage)) = &latest_rate_limit {
+        if usage.cached {
+            println!(
+                "  usage: cached (refresh failed: {})",
+                usage.cache_error.as_deref().unwrap_or("unknown error")
+            );
+        }
         if let Some((used, reset_in, reset_at)) =
             active_five_hour_window(usage).and_then(summarize_window)
         {
@@ -430,7 +450,16 @@ fn show_pi_status(
 ) {
     let (pi_auth, pi_usage) = match fetch_pi_rate_limit(ctx, pi_auth.clone()) {
         Ok((usage, refreshed_auth)) => (refreshed_auth, Ok(usage)),
-        Err(err) => (pi_auth.clone(), Err(err)),
+        Err(err) => (
+            pi_auth.clone(),
+            usage_or_cached(
+                Err(err),
+                tracker,
+                "pi:openai-codex",
+                pi_auth.account_id.as_deref(),
+                &extract_email_from_token(&pi_auth.access).unwrap_or_else(|| "?".to_string()),
+            ),
+        ),
     };
     let pi_profile = detect_profile_from_pi_auth(ctx, &pi_auth);
     let pi_payload = decode_token_payload(&pi_auth.access);
@@ -462,7 +491,7 @@ fn show_pi_status(
             fingerprint_secret(pi_auth.refresh.as_deref()),
         );
 
-        if let Ok(usage) = pi_usage.as_ref() {
+        if let Some(usage) = pi_usage.as_ref().ok().filter(|usage| !usage.cached) {
             update_entry_rate_limit_from_usage(entry, usage);
         }
     }
@@ -502,7 +531,7 @@ fn show_pi_status(
             .openai_auth
             .as_ref()
             .and_then(|auth| auth.chatgpt_user_id.as_deref())
-            .or_else(|| payload.sub.as_deref())
+            .or(payload.sub.as_deref())
             .unwrap_or("?");
         let client_id = payload.client_id.as_deref().unwrap_or("?");
         let session_id = payload.session_id.as_deref().unwrap_or("?");
@@ -529,6 +558,12 @@ fn show_pi_status(
 
     match &pi_usage {
         Ok(usage) => {
+            if usage.cached {
+                println!(
+                    "  usage: cached (refresh failed: {})",
+                    usage.cache_error.as_deref().unwrap_or("unknown error")
+                );
+            }
             println!(
                 "  usage_plan: {}",
                 usage.plan_type.as_deref().unwrap_or("?")

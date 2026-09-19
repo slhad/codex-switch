@@ -83,7 +83,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: panelLoader.item ? panelLoader.item.barText : "󱚣 ?"
+    text: panelLoader.item ? panelLoader.item.barText : "\uf915 ?"
+    labelVisible: false
     active: panelLoader.item ? panelLoader.item.alarming : false
     tooltipText: panelLoader.item
       ? panelLoader.item.barTooltip
@@ -93,6 +94,28 @@ BarWidget {
       if (buttonCode === Qt.RightButton) root.refresh()
       else if (buttonCode === Qt.MiddleButton) root.nextAccount()
       else if (buttonCode === Qt.LeftButton) root.toggle()
+    }
+  }
+
+  Row {
+    anchors.centerIn: button
+    spacing: 4
+
+    Text {
+      text: "\uf915"
+      color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+      font.family: "bootstrap-icons"
+      font.pixelSize: button.fontSize
+      verticalAlignment: Text.AlignVCenter
+      transform: Translate { y: 1 }
+    }
+
+    Text {
+      text: panelLoader.item ? panelLoader.item.barDetail : "?"
+      color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+      font.family: button.fontFamily
+      font.pixelSize: button.fontSize
+      verticalAlignment: Text.AlignVCenter
     }
   }
 }

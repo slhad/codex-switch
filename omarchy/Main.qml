@@ -24,9 +24,17 @@ Item {
     var revision = root.dataRevision
     return root.findActiveAccount()
   }
+  readonly property var barAccount: {
+    var revision = root.dataRevision
+    return root.findBarAccount()
+  }
   readonly property string barTextValue: {
     var revision = root.dataRevision
     return root.barText()
+  }
+  readonly property string barDetailValue: {
+    var revision = root.dataRevision
+    return root.barDetail()
   }
   readonly property string barTooltipValue: {
     var revision = root.dataRevision
@@ -44,10 +52,47 @@ Item {
   property bool desktopConfirmationOpen: false
   property string desktopCheckError: ""
   property bool desktopCheckHandled: false
+  property bool streamCheckHandled: false
+  property bool streamingDetected: false
+  property var streamingProcesses: []
+  property string streamCheckError: ""
+  property string privacySettingError: ""
   readonly property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 900)))
   readonly property string binaryPath: expandPath(String(setting("binaryPath", "codex-switch")))
   readonly property string percentMode: String(setting("percentMode", "used")).toLowerCase() === "remaining"
     ? "remaining" : "used"
+  readonly property bool hideEmailsSetting: setting("hideEmails", false) === true
+  readonly property bool autoHideEmailsWhenStreaming: setting("autoHideEmailsWhenStreaming", false) === true
+  readonly property int streamingCheckIntervalSec: {
+    var value = Number(setting("streamingCheckIntervalSec", 10))
+    return isFinite(value) ? Math.max(5, Math.min(60, Math.round(value))) : 10
+  }
+  readonly property bool streamingCheckRunning: streamingCheckProcess.running
+  readonly property bool privacySettingRunning: privacySettingProcess.running
+  readonly property bool emailsHidden: root.hideEmailsSetting
+    || (root.autoHideEmailsWhenStreaming && root.streamingDetected)
+  readonly property string emailPrivacyText: {
+    var revision = root.dataRevision
+    if (root.privacySettingRunning) return "Updating email privacy setting..."
+    if (root.privacySettingError !== "")
+      return "Privacy setting error: " + root.privacySettingError
+    if (root.hideEmailsSetting) return "Emails hidden by plugin setting"
+    if (root.autoHideEmailsWhenStreaming && root.streamingDetected)
+      return "Emails hidden while streaming"
+    return "Emails visible"
+  }
+  readonly property string streamingStatusText: {
+    var revision = root.dataRevision
+    if (root.streamCheckError !== "") return "Streaming check: " + root.streamCheckError
+    if (root.streamingCheckRunning) return "Checking for OBS..."
+    if (root.streamingDetected) {
+      var processes = Array.isArray(root.streamingProcesses) ? root.streamingProcesses : []
+      return processes.length > 0
+        ? "Streaming detected: " + processes.join(", ")
+        : "Streaming detected"
+    }
+    return "No supported streaming app detected"
+  }
 
   Timer {
     interval: root.refreshIntervalSec * 1000
@@ -62,6 +107,14 @@ Item {
     running: true
     repeat: true
     onTriggered: root.nowMs = Date.now()
+  }
+
+  Timer {
+    interval: root.streamingCheckIntervalSec * 1000
+    running: root.autoHideEmailsWhenStreaming
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.checkStreaming()
   }
 
   Process {
@@ -136,6 +189,51 @@ Item {
     }
   }
 
+  Process {
+    id: streamingCheckProcess
+    running: false
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyStreamingStatus(text)
+    }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.streamCheckError = text.trim()
+    }
+
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && !root.streamCheckHandled) {
+        root.streamCheckError = root.streamCheckError !== ""
+          ? root.streamCheckError
+          : "codex-switch exited with status " + exitCode
+        root.dataRevision++
+      }
+    }
+  }
+
+  Process {
+    id: privacySettingProcess
+    running: false
+
+    stdout: StdioCollector { waitForEnd: true }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.privacySettingError = String(text || "").trim()
+    }
+
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.privacySettingError = ""
+      } else if (root.privacySettingError === "") {
+        root.privacySettingError = "omarchy bar set exited with status " + exitCode
+      }
+      root.dataRevision++
+    }
+  }
+
   function setting(name, fallback) {
     var value = root.settings ? root.settings[name] : undefined
     return value === undefined || value === null ? fallback : value
@@ -162,6 +260,31 @@ Item {
     updateProcess.running = true
   }
 
+  function checkStreaming() {
+    if (streamingCheckProcess.running) return false
+    root.streamCheckHandled = false
+    root.streamCheckError = ""
+    streamingCheckProcess.command = [root.binaryPath, "omarchy", "streaming-status"]
+    streamingCheckProcess.running = true
+    return true
+  }
+
+  function setHideEmails(enabled) {
+    if (privacySettingProcess.running) return false
+    var next = enabled === true
+    root.privacySettingError = ""
+    privacySettingProcess.command = [
+      "omarchy", "bar", "set", "io.github.slhad.codex-switch",
+      "hideEmails", next ? "true" : "false", "--json"
+    ]
+    privacySettingProcess.running = true
+    return true
+  }
+
+  function toggleHideEmails() {
+    return root.setHideEmails(!root.hideEmailsSetting)
+  }
+
   function applySnapshot(content) {
     try {
       var parsed = JSON.parse(String(content || ""))
@@ -180,6 +303,48 @@ Item {
       if (accounts[i] && accounts[i].current === true) return accounts[i]
     }
     return accounts.length > 0 ? accounts[0] : null
+  }
+
+  function accountMeta(account) {
+    if (!account) return ""
+    var parts = []
+    if (!root.emailsHidden && String(account.email || "") !== "")
+      parts.push(String(account.email))
+    if (account.current === true) parts.push("current")
+    return parts.join(" · ")
+  }
+
+  function accountIdentity(account) {
+    return root.emailsHidden ? "" : String(account.email || "?")
+  }
+
+  function findBarAccount() {
+    var hit = root.snapshot ? root.snapshot.lastQuotaHit : null
+    if (hit) {
+      var provider = String(hit.provider || "").toLowerCase()
+      var profile = String(hit.profile || "")
+      var email = String(hit.email || "").toLowerCase()
+
+      for (var i = 0; i < accounts.length; i++) {
+        var account = accounts[i]
+        var sources = account && Array.isArray(account.sources) ? account.sources : []
+        for (var j = 0; j < sources.length; j++) {
+          var source = sources[j]
+          if (provider !== "" && profile !== ""
+              && String(source.provider || "").toLowerCase() === provider
+              && String(source.profile || "") === profile)
+            return account
+        }
+      }
+
+      if (email !== "") {
+        for (var k = 0; k < accounts.length; k++) {
+          if (String(accounts[k].email || "").toLowerCase() === email)
+            return accounts[k]
+        }
+      }
+    }
+    return root.findActiveAccount()
   }
 
   function quotaFor(account) {
@@ -224,9 +389,22 @@ Item {
     return String(Math.round(Number(value))) + "%"
   }
 
+  function formatModelUsage(value, units) {
+    if (value === null || value === undefined || !isFinite(Number(value))) return "?"
+    var formatted = Number(value).toFixed(2).replace(/\.?0+$/, "")
+    return formatted + (String(units || "").toLowerCase() === "percent" ? " pp" : "")
+  }
+
+  function formatTokenCount(value) {
+    if (value === null || value === undefined || !isFinite(Number(value))) return "?"
+    return String(Math.round(Number(value))).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+  }
+
   function formatDuration(resetAt) {
     if (!resetAt) return ""
-    var remaining = new Date(String(resetAt)).getTime() - root.nowMs
+    var resetMs = new Date(String(resetAt)).getTime()
+    if (!isFinite(resetMs)) return ""
+    var remaining = resetMs - root.nowMs
     if (!(remaining > 0)) return "now"
     var minutes = Math.floor(remaining / 60000)
     var hours = Math.floor(minutes / 60)
@@ -234,6 +412,58 @@ Item {
     if (days > 0) return days + "d " + (hours % 24) + "h"
     if (hours > 0) return hours + "h " + (minutes % 60) + "m"
     return Math.max(1, minutes) + "m"
+  }
+
+  function formatExpiry(timestamp) {
+    var date = new Date(String(timestamp || ""))
+    if (!isFinite(date.getTime())) return "unknown"
+
+    var month = date.getMonth() + 1
+    var day = date.getDate()
+    var hours = date.getHours()
+    var minutes = date.getMinutes()
+    return String(date.getFullYear()) + "-"
+      + (month < 10 ? "0" : "") + month + "-"
+      + (day < 10 ? "0" : "") + day + " "
+      + (hours < 10 ? "0" : "") + hours + ":"
+      + (minutes < 10 ? "0" : "") + minutes
+  }
+
+  function formatFetchAge(timestamp) {
+    var fetchedMs = new Date(String(timestamp || "")).getTime()
+    if (!isFinite(fetchedMs)) return "unknown"
+
+    var elapsed = Math.max(0, root.nowMs - fetchedMs)
+    if (elapsed < 60000) return "just now"
+
+    var minutes = Math.floor(elapsed / 60000)
+    var hours = Math.floor(minutes / 60)
+    var days = Math.floor(hours / 24)
+    if (days > 0) return days + "d " + (hours % 24) + "h ago"
+    if (hours > 0) return hours + "h " + (minutes % 60) + "m ago"
+    return minutes + "m ago"
+  }
+
+  function formatFetchTime(timestamp) {
+    var date = new Date(String(timestamp || ""))
+    if (!isFinite(date.getTime())) return "unknown"
+
+    var month = date.getMonth() + 1
+    var day = date.getDate()
+    var hours = date.getHours()
+    var minutes = date.getMinutes()
+    var seconds = date.getSeconds()
+    return String(date.getFullYear()) + "-"
+      + (month < 10 ? "0" : "") + month + "-"
+      + (day < 10 ? "0" : "") + day + " "
+      + (hours < 10 ? "0" : "") + hours + ":"
+      + (minutes < 10 ? "0" : "") + minutes + ":"
+      + (seconds < 10 ? "0" : "") + seconds
+  }
+
+  function fetchLabel(account) {
+    if (!account || !account.lastFetchedAt) return "Last API fetch: unavailable"
+    return "Last API fetch: " + formatFetchAge(account.lastFetchedAt)
   }
 
   function quotaWindowsSummary(account, separator) {
@@ -267,20 +497,24 @@ Item {
     return summary === "" ? "?" : summary
   }
 
-  function barText() {
-    var account = activeAccount
-    if (!account) return "󱚣 ?"
+  function barDetail() {
+    var account = barAccount
+    if (!account) return "?"
     var window = headlineWindow(account)
-    if (!window) return "󱚣 ?"
+    if (!window) return "?"
 
     if (window.kind === "month") {
       var reset = formatDuration(window.resetAt)
-      return "󱚣 " + formatPercent(percentValue(window))
+      return formatPercent(percentValue(window))
         + (reset === "" ? "" : " 󰥔 " + reset)
     }
 
     var summary = quotaWindowsSummary(account, " · ")
-    return summary === "" ? "󱚣 ?" : "󱚣 " + summary
+    return summary === "" ? "?" : summary
+  }
+
+  function barText() {
+    return "\uf915 " + root.barDetail()
   }
 
   function barTooltip() {
@@ -289,9 +523,17 @@ Item {
     var lines = ["Codex Switch"]
     for (var i = 0; i < accounts.length; i++) {
       var account = accounts[i]
-      var marker = account.current === true ? "* " : "- "
-      lines.push(marker + String(account.name || "?") + " · "
-        + String(account.email || "?") + " · " + accountSummary(account))
+      var marker = barAccount && account.key === barAccount.key ? "* " : "- "
+      var freshness = account.status === "stale" ? " · cached" : ""
+      var fetched = account.lastFetchedAt
+        ? " · fetched " + formatFetchAge(account.lastFetchedAt)
+          + " · " + formatFetchTime(account.lastFetchedAt)
+        : " · fetch time unavailable"
+      var identity = root.accountIdentity(account)
+      var line = marker + String(account.name || "?")
+      if (identity !== "") line += " · " + identity
+      line += " · " + accountSummary(account) + freshness + fetched
+      lines.push(line)
     }
     if (root.errorText !== "") lines.push("Refresh: " + root.errorText)
     return lines.join("\n")
@@ -383,5 +625,34 @@ Item {
   function resetCredits(account) {
     var quota = quotaFor(account)
     return quota && quota.resetCredits ? quota.resetCredits : null
+  }
+
+  function applyStreamingStatus(content) {
+    root.streamCheckHandled = true
+    try {
+      var parsed = JSON.parse(String(content || ""))
+      if (!parsed || typeof parsed.streaming !== "boolean"
+          || !Array.isArray(parsed.processes))
+        throw new Error("invalid streaming status")
+
+      var processes = []
+      for (var i = 0; i < parsed.processes.length; i++) {
+        if (typeof parsed.processes[i] !== "string")
+          throw new Error("invalid streaming process name")
+        processes.push(parsed.processes[i])
+      }
+      root.streamingDetected = parsed.streaming
+      root.streamingProcesses = processes
+      root.streamCheckError = ""
+      root.dataRevision++
+    } catch (error) {
+      root.streamCheckError = String(error)
+      root.dataRevision++
+    }
+  }
+
+  onSettingsChanged: {
+    root.dataRevision++
+    if (root.autoHideEmailsWhenStreaming) Qt.callLater(root.checkStreaming)
   }
 }

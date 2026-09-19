@@ -20,6 +20,8 @@ pub struct Cli {
 pub enum Command {
     /// Show current profile and OAuth usage status
     Status(StatusArgs),
+    /// Show model usage for saved and live OAuth profiles
+    Usage(UsageArgs),
     /// Switch to a saved profile
     Switch(SwitchArgs),
     /// Stop Codex processes
@@ -51,6 +53,16 @@ pub struct StatusArgs {
     /// Print raw OAuth usage payloads
     #[arg(long, value_enum)]
     pub debug: Option<DebugTarget>,
+}
+
+#[derive(Args, Debug)]
+pub struct UsageArgs {
+    /// Limit output to one profile name
+    #[arg(long, add = clap_complete::ArgValueCandidates::new(crate::completions::all_profiles))]
+    pub profile: Option<ProfileName>,
+    /// Print machine-readable JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -297,6 +309,8 @@ pub enum OmarchyCommand {
     Print,
     /// Report whether the Codex desktop app is running
     DesktopStatus,
+    /// Report whether a supported OBS streaming process is running
+    StreamingStatus,
     /// Install the Omarchy Quickshell plugin from git or a local directory
     Install(OmarchyPluginInstallArgs),
     /// Update the Omarchy Quickshell plugin from git or a local directory
@@ -462,6 +476,8 @@ mod tests {
             vec!["codex-switch", "me"],
             vec!["codex-switch", "status"],
             vec!["codex-switch", "status", "--debug", "all"],
+            vec!["codex-switch", "usage"],
+            vec!["codex-switch", "usage", "--profile", "work", "--json"],
             vec!["codex-switch", "switch", "work"],
             vec![
                 "codex-switch",
@@ -567,6 +583,7 @@ mod tests {
             vec!["codex-switch", "waybar", "install"],
             vec!["codex-switch", "omarchy", "print"],
             vec!["codex-switch", "omarchy", "desktop-status"],
+            vec!["codex-switch", "omarchy", "streaming-status"],
             vec![
                 "codex-switch",
                 "omarchy",
@@ -660,6 +677,12 @@ mod tests {
         let reserved = Cli::try_parse_from(["codex-switch", "status"]).unwrap();
         assert!(matches!(reserved.command, Some(Command::Status(_))));
         assert!(reserved.profile.is_none());
+        let usage = Cli::try_parse_from(["codex-switch", "usage", "--profile", "work"]).unwrap();
+        let Some(Command::Usage(args)) = usage.command else {
+            panic!("expected usage command");
+        };
+        assert_eq!(args.profile.as_ref().unwrap().as_str(), "work");
+        assert!(!args.json);
         assert!(Cli::try_parse_from(["codex-switch", "auto", "set", "work"]).is_err());
         assert!(
             Cli::try_parse_from(["codex-switch", "auto", "set", "work", "--pi", "maybe"]).is_err()
@@ -701,6 +724,7 @@ mod tests {
         for (path, argument) in [
             (&[][..], "profile"),
             (&["switch"][..], "profile"),
+            (&["usage"][..], "profile"),
             (&["auto", "set"][..], "profile"),
             (&["auto", "remove"][..], "profile"),
             (&["profile", "remove"][..], "name"),

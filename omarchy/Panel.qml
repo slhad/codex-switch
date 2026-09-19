@@ -25,8 +25,9 @@ Panel {
     ? accounts[selectedIndex] : null
   readonly property var selectedQuota: selectedAccount ? selectedAccount.quota : null
   readonly property string barText: usage.barTextValue
+  readonly property string barDetail: usage.barDetailValue
   readonly property string barTooltip: usage.barTooltipValue
-  readonly property bool alarming: usage.alarming(usage.activeAccount)
+  readonly property bool alarming: usage.alarming(usage.barAccount)
 
   function open() {
     usage.refresh()
@@ -121,94 +122,165 @@ Panel {
     open: root.opened
     centerOnBar: true
     focusTarget: keyCatcher
-    contentWidth: popup.fittedContentWidth(Style.space(390))
-    contentHeight: popup.fittedContentHeight(column.implicitHeight, Style.space(650))
+    contentWidth: popup.fittedContentWidth(Style.space(480))
+    contentHeight: popup.fittedContentHeight(column.implicitHeight, Style.space(840))
 
-    PanelKeyCatcher {
-      id: keyCatcher
+    FocusScope {
+      id: panelFocus
       anchors.fill: parent
-      blocked: usage.desktopConfirmationOpen
+      focus: true
 
-      onMoveRequested: function(dx, dy) {
-        if (dx !== 0) root.selectAccount(root.selectedIndex + dx)
-        if (dy !== 0)
+      function scrollToTop() {
+        accountScroll.contentY = 0
+      }
+
+      function scrollToBottom() {
+        accountScroll.contentY = Math.max(0, accountScroll.contentHeight - accountScroll.height)
+      }
+
+      function scrollByPage(direction) {
+        var maximum = Math.max(0, accountScroll.contentHeight - accountScroll.height)
+        var page = Math.max(Style.space(96), accountScroll.height * 0.85)
+        accountScroll.contentY = Math.max(0, Math.min(
+          maximum, accountScroll.contentY + direction * page))
+      }
+
+      // Keep Home/End and page navigation local to this panel. PanelKeyCatcher
+      // intentionally leaves these keys unhandled so they reach this scope.
+      Keys.priority: Keys.AfterItem
+      Keys.onPressed: function(event) {
+        if (event.key === Qt.Key_PageDown) {
+          panelFocus.scrollByPage(1); event.accepted = true
+        } else if (event.key === Qt.Key_PageUp) {
+          panelFocus.scrollByPage(-1); event.accepted = true
+        } else if (event.key === Qt.Key_Home) {
+          panelFocus.scrollToTop(); event.accepted = true
+        } else if (event.key === Qt.Key_End) {
+          panelFocus.scrollToBottom(); event.accepted = true
+        }
+      }
+
+      WheelHandler {
+        id: panelWheel
+        target: null
+        orientation: Qt.Vertical
+        enabled: accountScroll.contentHeight > accountScroll.height
+        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+
+        onWheel: function(event) {
+          var angle = Number(event.angleDelta.y)
+          var pixels = Number(event.pixelDelta.y)
+          var delta = 0
+
+          if (angle !== 0) {
+            var steps = Math.max(1, Math.abs(angle) / 120)
+            delta = (angle > 0 ? -1 : 1) * Style.space(10) * 10 * steps
+          } else if (pixels !== 0) {
+            delta = -pixels * 1.5
+          }
+
+          if (delta === 0) return
+          var maximum = Math.max(0, accountScroll.contentHeight - accountScroll.height)
           accountScroll.contentY = Math.max(0, Math.min(
-            accountScroll.contentHeight - accountScroll.height,
-            accountScroll.contentY + dy * Style.space(56)))
-      }
-      onActivateRequested: usage.refresh()
-      onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(text) {
-        if (text === "r" || text === "R") usage.refresh()
-        else if (text === "n" || text === "N") root.nextAccount()
+            maximum, accountScroll.contentY + delta))
+          event.accepted = true
+        }
       }
 
-      ConfirmDialog {
-        id: desktopConfirm
+      PanelKeyCatcher {
+        id: keyCatcher
         anchors.fill: parent
-        z: 20
-        opened: usage.desktopConfirmationOpen
-        message: usage.desktopConfirmationMessage
-        confirmText: "Kill & switch"
-        background: Color.background
-        foreground: root.foreground
-        scrim: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.7)
-        selectedBackground: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
-        selectedText: Color.accent
-        fontFamily: root.fontFamily
-        cornerRadius: Style.cornerRadius
-        focus: opened
+        blocked: usage.desktopConfirmationOpen
 
-        Keys.priority: Keys.BeforeItem
-        Keys.onPressed: function(event) {
-          if (desktopConfirm.handleKey(event)) event.accepted = true
+        onMoveRequested: function(dx, dy) {
+          if (dx !== 0) root.selectAccount(root.selectedIndex + dx)
+          if (dy !== 0)
+            accountScroll.contentY = Math.max(0, Math.min(
+              accountScroll.contentHeight - accountScroll.height,
+              accountScroll.contentY + dy * Style.space(56)))
+        }
+        onActivateRequested: usage.refresh()
+        onCloseRequested: root.close()
+        onTabRequested: function(direction) { root.switchPanel(direction) }
+        onTextKey: function(text) {
+          if (text === "r" || text === "R") usage.refresh()
+          else if (text === "n" || text === "N") root.nextAccount()
         }
 
-        onOpenedChanged: if (opened) forceActiveFocus()
-        onCanceled: {
-          usage.cancelDesktopSwitch()
-          Qt.callLater(keyCatcher.forceActiveFocus)
-        }
-        onConfirmed: {
-          usage.confirmDesktopSwitch()
-          Qt.callLater(keyCatcher.forceActiveFocus)
-        }
-      }
+        ConfirmDialog {
+          id: desktopConfirm
+          anchors.fill: parent
+          z: 20
+          opened: usage.desktopConfirmationOpen
+          message: usage.desktopConfirmationMessage
+          confirmText: "Kill & switch"
+          background: Color.background
+          foreground: root.foreground
+          scrim: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.7)
+          selectedBackground: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+          selectedText: Color.accent
+          fontFamily: root.fontFamily
+          cornerRadius: Style.cornerRadius
+          focus: opened
 
-      Flickable {
-        id: accountScroll
-        anchors.fill: parent
-        contentWidth: width
-        contentHeight: column.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+          Keys.priority: Keys.BeforeItem
+          Keys.onPressed: function(event) {
+            if (desktopConfirm.handleKey(event)) event.accepted = true
+          }
 
-        Column {
-          id: column
-          width: accountScroll.width
-          spacing: Style.space(12)
+          onOpenedChanged: if (opened) forceActiveFocus()
+          onCanceled: {
+            usage.cancelDesktopSwitch()
+            Qt.callLater(keyCatcher.forceActiveFocus)
+          }
+          onConfirmed: {
+            usage.confirmDesktopSwitch()
+            Qt.callLater(keyCatcher.forceActiveFocus)
+          }
+        }
+
+        Flickable {
+          id: accountScroll
+          anchors.fill: parent
+          contentWidth: width
+          contentHeight: column.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          flickableDirection: Flickable.VerticalFlick
+          interactive: contentHeight > height
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          Column {
+            id: column
+            width: accountScroll.width
+            spacing: Style.space(12)
 
           PanelHero {
             visible: !!root.selectedAccount
             width: parent.width
             title: root.selectedAccount ? String(root.selectedAccount.name || "Account") : ""
             meta: root.selectedAccount
-              ? String(root.selectedAccount.email || "")
-                + (root.selectedAccount.current ? " · current" : "")
+              ? usage.accountMeta(root.selectedAccount)
               : ""
             foreground: root.foreground
             fontFamily: root.fontFamily
 
             iconComponent: Component {
               Text {
-                text: "󱚣"
+                text: "\uf915"
                 color: root.foreground
-                font.family: root.fontFamily
+                font.family: "bootstrap-icons"
                 font.pixelSize: Style.font.display
+              }
+            }
+            trailingControl: Component {
+              PanelActionButton {
+                size: Style.space(26)
+                iconText: "↓"
+                tooltipText: "Privacy"
+                foreground: root.foreground
+                hoverColor: Color.accent
+                onClicked: panelFocus.scrollToBottom()
               }
             }
           }
@@ -321,8 +393,10 @@ Panel {
                   }
 
                   Text {
-                    text: modelData.live === true ? "CURRENT" : String(modelData.status || "")
-                    color: modelData.status === "ok" ? root.dim : Color.urgent
+                    text: modelData.live === true
+                      ? (modelData.status === "stale" ? "CURRENT · CACHED" : "CURRENT")
+                      : String(modelData.status || "").toUpperCase()
+                    color: modelData.status === "unavailable" ? Color.urgent : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     width: parent.width * 0.20
@@ -348,7 +422,7 @@ Panel {
                   anchors.topMargin: Style.space(2)
                   width: parent.width
                   text: String(modelData.error || "Usage unavailable")
-                  color: Color.urgent
+                  color: modelData.status === "unavailable" ? Color.urgent : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
@@ -372,6 +446,15 @@ Panel {
               text: "QUOTAS"
               foreground: root.foreground
               fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: usage.fetchLabel(root.selectedAccount)
+              color: root.selectedAccount && root.selectedAccount.status === "stale"
+                ? Color.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
 
             Repeater {
@@ -435,62 +518,229 @@ Panel {
               }
             }
 
-            BorderSurface {
+            Column {
+              id: monthlyColumn
               visible: !!root.selectedQuota && !!root.selectedQuota.monthly
               width: parent.width
-              implicitHeight: monthlyColumn.implicitHeight + Style.space(18)
-              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.05)
-              borderSpec: Border.flat(Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15), 1)
-              radius: Style.cornerRadius
+              spacing: Style.space(6)
 
-              Column {
-                id: monthlyColumn
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.margins: Style.space(9)
-                spacing: Style.space(4)
+              Text {
+                text: "MONTHLY CREDITS"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
 
-                Text {
-                  text: "MONTHLY CREDITS"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
+              Rectangle {
+                width: parent.width
+                height: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
+                radius: height / 2
+                color: root.track
 
-                Text {
-                  text: {
+                Rectangle {
+                  width: {
                     var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
-                    return monthly ? String(monthly.used === null || monthly.used === undefined ? "?" : monthly.used)
-                      + " / " + String(monthly.limit === null || monthly.limit === undefined ? "?" : monthly.limit)
-                      + " used (" + usage.formatPercent(monthly.usedPercent) + ")" : ""
+                    var value = monthly ? usage.percentValue(monthly) : null
+                    return parent.width * (value === null
+                      ? 0 : Math.max(0, Math.min(1, Number(value) / 100)))
                   }
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                }
-
-                Text {
-                  text: {
+                  height: parent.height
+                  radius: parent.radius
+                  color: {
                     var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
-                    return monthly ? String(monthly.remaining === null || monthly.remaining === undefined ? "?" : monthly.remaining)
-                      + " credits left (" + usage.formatPercent(monthly.remainingPercent) + ")"
-                      + (monthly.reached === true ? " · limit reached" : "") : ""
+                    return Number(monthly && monthly.usedPercent || 0) >= 90
+                      ? Color.urgent : root.foreground
                   }
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Text {
+                text: {
+                  var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
+                  return monthly ? String(monthly.used === null || monthly.used === undefined ? "?" : monthly.used)
+                    + " / " + String(monthly.limit === null || monthly.limit === undefined ? "?" : monthly.limit)
+                    + " used (" + usage.formatPercent(monthly.usedPercent) + ")" : ""
+                }
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                text: {
+                  var monthly = root.selectedQuota ? root.selectedQuota.monthly : null
+                  return monthly ? String(monthly.remaining === null || monthly.remaining === undefined ? "?" : monthly.remaining)
+                    + " credits left (" + usage.formatPercent(monthly.remainingPercent) + ")"
+                    + (monthly.reached === true ? " · limit reached" : "") : ""
+                }
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                visible: !!root.selectedQuota && !!root.selectedQuota.monthly
+                  && !!root.selectedQuota.monthly.resetAt
+                text: root.selectedQuota && root.selectedQuota.monthly
+                  ? "Resets in " + usage.formatDuration(root.selectedQuota.monthly.resetAt) : ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Column {
+              id: tokenUsageColumn
+              visible: {
+                var tokenUsage = root.selectedQuota ? root.selectedQuota.tokenUsage : null
+                return !!tokenUsage && Number(tokenUsage.days || 0) > 0
+              }
+              width: parent.width
+              spacing: Style.space(6)
+
+              PanelSectionHeader {
+                width: parent.width
+                text: {
+                  var tokenUsage = root.selectedQuota ? root.selectedQuota.tokenUsage : null
+                  return "TOKENS USED · " + String(tokenUsage && tokenUsage.days || 0) + "D"
+                }
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                width: parent.width
+                text: {
+                  var tokenUsage = root.selectedQuota ? root.selectedQuota.tokenUsage : null
+                  return usage.formatTokenCount(tokenUsage ? tokenUsage.totalTokens : null)
+                    + " tokens"
+                }
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                visible: {
+                  var tokenUsage = root.selectedQuota ? root.selectedQuota.tokenUsage : null
+                  return !!tokenUsage && tokenUsage.peakDailyTokens !== null
+                    && tokenUsage.peakDailyTokens !== undefined
+                }
+                text: {
+                  var tokenUsage = root.selectedQuota ? root.selectedQuota.tokenUsage : null
+                  return "Peak day: " + usage.formatTokenCount(
+                    tokenUsage ? tokenUsage.peakDailyTokens : null) + " tokens"
+                }
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Column {
+              id: modelUsageColumn
+              visible: {
+                var modelUsage = root.selectedQuota ? root.selectedQuota.modelUsage : null
+                return !!modelUsage && Array.isArray(modelUsage.models)
+                  && modelUsage.models.length > 0
+              }
+              width: parent.width
+              spacing: Style.space(6)
+
+              PanelSectionHeader {
+                width: parent.width
+                text: {
+                  var modelUsage = root.selectedQuota ? root.selectedQuota.modelUsage : null
+                  var rawUnits = modelUsage && modelUsage.units
+                    ? String(modelUsage.units).toLowerCase() : ""
+                  var units = rawUnits === "percent"
+                    ? " · PERCENTAGE POINTS"
+                    : (rawUnits === "" ? "" : " · " + rawUnits.toUpperCase())
+                  return "DAILY MODEL USAGE · " + String(modelUsage && modelUsage.days || 0) + "D"
+                    + units
+                }
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              ModelUsageChart {
+                id: modelUsageChart
+                width: parent.width
+                scopeKey: root.selectedAccount ? root.selectedAccount.key : ""
+                daily: root.selectedQuota && root.selectedQuota.modelUsage
+                  ? root.selectedQuota.modelUsage.daily : []
+                series: root.selectedQuota && root.selectedQuota.modelUsage
+                  ? root.selectedQuota.modelUsage.models : []
+                liveUsage: {
+                  var quota = root.selectedQuota
+                  if (!quota) return false
+                  var windows = Array.isArray(quota.windows) ? quota.windows : []
+                  for (var i = 0; i < windows.length; i++) {
+                    if (Number(windows[i].usedPercent || 0) > 0) return true
+                  }
+                  return !!quota.monthly && Number(quota.monthly.usedPercent || 0) > 0
+                }
+                foreground: root.foreground
+                dim: root.dim
+                track: root.track
+              }
+
+              PanelSeparator {
+                foreground: root.foreground
+              }
+
+              PanelSectionHeader {
+                width: parent.width
+                text: {
+                  var modelUsage = root.selectedQuota ? root.selectedQuota.modelUsage : null
+                  return "MODEL TOTALS"
+                    + (modelUsage && String(modelUsage.units || "").toLowerCase() === "percent"
+                      ? " · PERCENTAGE POINTS" : "")
+                }
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: {
+                  var modelUsage = root.selectedQuota ? root.selectedQuota.modelUsage : null
+                  return modelUsage && Array.isArray(modelUsage.models) ? modelUsage.models : []
                 }
 
-                Text {
-                  visible: !!root.selectedQuota && !!root.selectedQuota.monthly
-                    && !!root.selectedQuota.monthly.resetAt
-                  text: root.selectedQuota && root.selectedQuota.monthly
-                    ? "Resets in " + usage.formatDuration(root.selectedQuota.monthly.resetAt) : ""
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                Item {
+                  required property var modelData
+                  width: parent.width
+                  implicitHeight: modelRow.implicitHeight
+
+                  Row {
+                    id: modelRow
+                    width: parent.width
+                    spacing: Style.space(8)
+
+                    Text {
+                      width: (parent.width - parent.spacing) * 0.74
+                      text: String(modelData.model || "model")
+                        + (modelData.speed ? " · " + String(modelData.speed) : "")
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      width: (parent.width - parent.spacing) * 0.26
+                      text: usage.formatModelUsage(
+                        modelData.credits,
+                        root.selectedQuota && root.selectedQuota.modelUsage
+                          ? root.selectedQuota.modelUsage.units : ""
+                      )
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      horizontalAlignment: Text.AlignRight
+                    }
+                  }
                 }
               }
             }
@@ -528,18 +778,24 @@ Panel {
               Text {
                 required property var modelData
                 width: parent.width
-                text: "• " + String(modelData.title || "Reset")
-                  + (modelData.expiresAt ? " · expires " + String(modelData.expiresAt) : "")
+                text: {
+                  var title = String(modelData.title || "Reset")
+                  if (!modelData.expiresAt) return "• " + title
+                  var remaining = usage.formatDuration(modelData.expiresAt)
+                  return "• " + title + " · "
+                    + (remaining === "" ? "" : "in " + remaining + " · ")
+                    + usage.formatExpiry(modelData.expiresAt)
+                }
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
+                wrapMode: Text.Wrap
               }
             }
           }
 
           Text {
-            visible: usage.snapshot.lastQuotaHit && usage.snapshot.lastQuotaHit.profile
+            visible: !!(usage.snapshot.lastQuotaHit && usage.snapshot.lastQuotaHit.profile)
             width: parent.width
             text: usage.snapshot.lastQuotaHit
               ? "Last quota hit: " + String(usage.snapshot.lastQuotaHit.profile || "?")
@@ -551,6 +807,100 @@ Panel {
             font.pixelSize: Style.font.caption
             horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideRight
+          }
+
+          PanelSeparator {
+            foreground: root.foreground
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "PRIVACY"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(4)
+
+              Column {
+                width: parent.width
+                spacing: Style.space(4)
+
+                Text {
+                  width: parent.width
+                  text: usage.emailPrivacyText
+                  color: usage.emailsHidden ? root.foreground : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  text: usage.streamingStatusText
+                  color: usage.streamingDetected ? Color.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Button {
+                id: hideEmailsButton
+                text: usage.hideEmailsSetting ? "Allow emails" : "Hide emails"
+                selected: usage.hideEmailsSetting
+                enabled: !usage.privacySettingRunning
+                  && !usage.updating && !usage.switching
+                bordered: true
+                focusable: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                verticalPadding: Style.space(3)
+                tooltipText: usage.hideEmailsSetting
+                  ? "Allow account emails when auto-hide is not active"
+                  : "Always hide account emails"
+                onClicked: usage.toggleHideEmails()
+              }
+
+              Button {
+                id: streamingCheckButton
+                text: usage.streamingCheckRunning ? "Checking..." : "Check streaming"
+                enabled: !usage.streamingCheckRunning
+                  && !usage.privacySettingRunning
+                  && !usage.updating && !usage.switching
+                bordered: true
+                focusable: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                verticalPadding: Style.space(3)
+                onClicked: usage.checkStreaming()
+              }
+            }
+
+            Text {
+              width: parent.width
+              text: usage.autoHideEmailsWhenStreaming
+                ? "Auto-hide is enabled; the button controls permanent hiding."
+                : "The button stores the permanent hide setting; auto-hide is in plugin settings."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
           }
         }
       }

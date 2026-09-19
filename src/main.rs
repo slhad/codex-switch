@@ -16,6 +16,7 @@ mod switch;
 mod systemd;
 mod t3_code;
 mod tracker;
+mod usage;
 mod waybar;
 mod waybar_config;
 
@@ -54,6 +55,9 @@ fn dispatch(command: Option<Command>, profile: Option<ProfileName>, ctx: &data::
                 Some(DebugTarget::All) => (true, true),
             };
             status::show_status(ctx, codex, pi);
+        }
+        Some(Command::Usage(args)) => {
+            usage::print_usage(ctx, args.profile.as_ref(), args.json);
         }
         Some(Command::Switch(args)) => {
             if args.kill {
@@ -187,6 +191,7 @@ fn dispatch(command: Option<Command>, profile: Option<ProfileName>, ctx: &data::
             OmarchyCommand::DesktopStatus => {
                 println!("{{\"running\":{}}}", process::codex_desktop_running())
             }
+            OmarchyCommand::StreamingStatus => process::print_streaming_status(),
             OmarchyCommand::Install(args) => omarchy_plugin::install(
                 args.source.source.as_deref(),
                 args.source.git.as_deref(),

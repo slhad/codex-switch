@@ -31,6 +31,7 @@ Running with no arguments is equivalent to `status`. A bare profile name is shor
 codex-switch
 codex-switch PROFILE
 codex-switch status [--debug codex|pi|all]
+codex-switch usage [--profile PROFILE] [--json]
 codex-switch switch PROFILE [--target codex|pi|both] [--force] [--kill]
 codex-switch stop [--remote-only]
 
@@ -61,6 +62,7 @@ codex-switch waybar print [--format FORMAT] [--tooltip-format FORMAT]
 codex-switch waybar install
 codex-switch omarchy print
 codex-switch omarchy desktop-status
+codex-switch omarchy streaming-status
 codex-switch omarchy install [SOURCE | --git URL | --local [DIRECTORY]] [--enable] [--yes]
 codex-switch omarchy update [SOURCE | --git URL | --local [DIRECTORY]] [--yes]
 
@@ -79,6 +81,8 @@ Examples:
 
 ```bash
 rtk cargo run -- status --debug all
+rtk cargo run -- usage
+rtk cargo run -- usage --profile work --json
 rtk cargo run -- switch work --target codex
 rtk cargo run -- profile save codex work
 rtk cargo run -- profile import codex work ./auth.json
@@ -154,6 +158,47 @@ profiles can be switched explicitly from the panel. Before switching a Codex
 source, the plugin checks for a running Codex desktop app and asks whether it
 should terminate it before continuing.
 
+The panel also displays the model and speed breakdown returned by the account's
+daily usage endpoint, including a stacked graph by model. Its `percent` values
+are daily allowance percentage points, not a share of one 100% total, so their
+multi-day totals can legitimately exceed 100. The panel labels these values
+`pp`/`PERCENTAGE POINTS` and separately shows the overall token total from the
+account usage buckets. The CLI equivalent is `codex-switch usage`; it reports
+all known profiles by default and accepts `--profile PROFILE` or `--json` for a
+single profile or machine-readable output. JSON output includes the daily model
+buckets used by the graph. The endpoint currently reports model and speed, but
+no separate reasoning or effort level. Both the model breakdown and token
+counter are optional; if either endpoint is unavailable, normal quota display
+continues to work.
+
+Successful usage responses are persisted per account. If a refresh fails, the
+bar and panel show the last known quotas with a `cached` marker; absolute reset
+timestamps continue to drive the countdown locally. Cached percentages remain
+marked stale after a reset because the new usage cannot be known without a
+fresh API response. The quick-shell panel also shows when the displayed usage
+was last fetched, both as an age and in the bar tooltip.
+
+The QuickShell panel can hide account email addresses from its account header
+and bar tooltip. Its `Hide emails`/`Allow emails` button persists the
+`hideEmails` setting for an immediate manual choice. The panel keeps Privacy
+at the bottom, offers a compact down-arrow jump button on the account header,
+and uses larger wheel steps for faster scrolling; `Home`, `End`, `PageUp`, and
+`PageDown` work inside the panel too. You can also enable
+`autoHideEmailsWhenStreaming` to hide them while a supported OBS process is
+running. Linux OBS (`obs`/`obs-studio`), Windows OBS (`obs.exe`/`obs64.exe`,
+including Wine), and the OBS Flatpak are detected. The panel's `Check
+streaming` button runs an immediate check; automatic detection polls at the
+configured `streamingCheckIntervalSec` interval.
+
+### Screenshots
+
+The live panel shows quota windows, token totals, daily model usage, reset
+credits, and the Privacy controls at the bottom:
+
+![Codex Switch panel overview](https://github.com/user-attachments/assets/21e84164-fb94-4861-b6b2-46726cb8f10c)
+
+![Codex Switch panel with Privacy controls](https://github.com/user-attachments/assets/9266277f-a45a-48b3-b761-056369618dbe)
+
 Build and install the binary first:
 
 ```bash
@@ -200,6 +245,8 @@ The plugin manifest is at the repository root and the QML entrypoint is
 ```bash
 omarchy bar set io.github.slhad.codex-switch refreshIntervalSec 900 --json
 omarchy bar set io.github.slhad.codex-switch percentMode used
+omarchy bar set io.github.slhad.codex-switch hideEmails true
+omarchy bar set io.github.slhad.codex-switch autoHideEmailsWhenStreaming true
 ```
 
 Validate it against the installed Quattro shell before enabling it:
