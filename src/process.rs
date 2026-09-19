@@ -2,6 +2,7 @@ use crate::data::Context;
 use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use serde::Serialize;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,6 +58,80 @@ fn list_codex_desktop_pids(proc_root: &Path) -> Vec<u32> {
 
 fn list_codex_app_server_pids(proc_root: &Path) -> Vec<u32> {
     list_matching_pids(proc_root, is_codex_app_server)
+}
+
+fn streaming_process_label(args: &[String]) -> Option<&'static str> {
+    for arg in args {
+        let value = arg.trim_matches(['"', '\'']);
+        let basename = value.rsplit(['/', '\\']).next().unwrap_or(value);
+
+        if basename.eq_ignore_ascii_case("obs") {
+            return Some("obs");
+        }
+        if basename.eq_ignore_ascii_case("obs-studio") {
+            return Some("obs-studio");
+        }
+        if basename.eq_ignore_ascii_case("obs64.exe") {
+            return Some("obs64.exe");
+        }
+        if basename.eq_ignore_ascii_case("obs.exe") {
+            return Some("obs.exe");
+        }
+        if basename.eq_ignore_ascii_case("com.obsproject.studio") {
+            return Some("obs-flatpak");
+        }
+    }
+
+    None
+}
+
+fn list_streaming_process_names(proc_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+
+    for entry in entries.filter_map(Result::ok) {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Ok(args) = read_cmdline(proc_root, pid) {
+            if let Some(name) = streaming_process_label(&args) {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamingStatus {
+    streaming: bool,
+    processes: Vec<String>,
+}
+
+fn streaming_status_at(proc_root: &Path) -> StreamingStatus {
+    let processes = list_streaming_process_names(proc_root);
+    StreamingStatus {
+        streaming: !processes.is_empty(),
+        processes,
+    }
+}
+
+pub fn print_streaming_status() {
+    let status = streaming_status_at(Path::new("/proc"));
+    println!(
+        "{}",
+        serde_json::to_string(&status)
+            .unwrap_or_else(|_| "{\"streaming\":false,\"processes\":[]}".to_string())
+    );
 }
 
 pub fn codex_desktop_running() -> bool {
@@ -257,7 +332,8 @@ fn remove_stale_socket(socket: &Path) -> Result<(), String> {
 mod tests {
     use super::{
         codex_desktop_running, find_socket_inode, find_socket_owners, is_codex_app_server,
-        list_codex_app_server_pids, list_codex_desktop_pids, read_cmdline, stop_remote_at,
+        list_codex_app_server_pids, list_codex_desktop_pids, list_streaming_process_names,
+        read_cmdline, stop_remote_at, streaming_process_label, streaming_status_at,
         wait_for_remote_to_stop,
     };
     use std::os::unix::fs::symlink;
@@ -382,6 +458,84 @@ mod tests {
 
         assert_eq!(list_codex_desktop_pids(&proc_root), vec![200, 202, 205]);
         let _ = codex_desktop_running();
+        std::fs::remove_dir_all(proc_root).unwrap();
+    }
+
+    #[test]
+    fn streaming_detection_accepts_linux_windows_and_flatpak_obs() {
+        let proc_root = fixture("streaming-pids");
+        for (pid, cmdline) in [
+            (300, b"/usr/bin/obs\0--startstreaming\0".as_slice()),
+            (
+                301,
+                b"/usr/bin/wine\0C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe\0".as_slice(),
+            ),
+            (
+                302,
+                b"/usr/bin/flatpak\0run\0com.obsproject.Studio\0".as_slice(),
+            ),
+            (
+                303,
+                b"/usr/bin/wine\0\"C:\\Program Files\\obs\\bin\\obs.exe\"\0".as_slice(),
+            ),
+            (304, b"/usr/bin/other-app\0--plugin=obs.exe\0".as_slice()),
+            (305, b"/usr/bin/not-obs\0--help\0".as_slice()),
+        ] {
+            std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+            std::fs::write(proc_root.join(format!("{pid}/cmdline")), cmdline).unwrap();
+        }
+
+        assert_eq!(
+            list_streaming_process_names(&proc_root),
+            vec![
+                "obs".to_string(),
+                "obs-flatpak".to_string(),
+                "obs.exe".to_string(),
+                "obs64.exe".to_string()
+            ]
+        );
+        assert_eq!(
+            streaming_process_label(&["/usr/bin/OBS-STUDIO".to_string()]),
+            Some("obs-studio")
+        );
+        assert_eq!(
+            streaming_status_at(&proc_root),
+            super::StreamingStatus {
+                streaming: true,
+                processes: vec![
+                    "obs".to_string(),
+                    "obs-flatpak".to_string(),
+                    "obs.exe".to_string(),
+                    "obs64.exe".to_string()
+                ]
+            }
+        );
+        std::fs::remove_dir_all(proc_root).unwrap();
+    }
+
+    #[test]
+    fn streaming_detection_handles_missing_proc_and_empty_proc() {
+        let missing = std::env::temp_dir().join(format!(
+            "codex-switch-process-missing-streaming-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(
+            streaming_status_at(&missing),
+            super::StreamingStatus {
+                streaming: false,
+                processes: Vec::new(),
+            }
+        );
+
+        let proc_root = fixture("empty-streaming");
+        assert_eq!(
+            streaming_status_at(&proc_root),
+            super::StreamingStatus {
+                streaming: false,
+                processes: Vec::new(),
+            }
+        );
         std::fs::remove_dir_all(proc_root).unwrap();
     }
 

@@ -21,7 +21,7 @@ pub struct Tokens {
     pub account_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UsageResponse {
     #[serde(default)]
     pub plan_type: Option<String>,
@@ -33,6 +33,16 @@ pub struct UsageResponse {
     pub credits: Option<UsageCredits>,
     #[serde(default)]
     pub rate_limit_reset_credits: Option<RateLimitResetCredits>,
+    #[serde(default)]
+    pub model_usage: Option<ModelUsageResponse>,
+    #[serde(default)]
+    pub token_usage: Option<TokenUsageResponse>,
+    #[serde(skip)]
+    pub(crate) cached: bool,
+    #[serde(skip)]
+    pub(crate) cache_error: Option<String>,
+    #[serde(skip)]
+    pub(crate) last_fetched_at: Option<String>,
 }
 
 impl UsageResponse {
@@ -49,7 +59,7 @@ impl UsageResponse {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UsageRateLimit {
     #[serde(default)]
     pub primary_window: Option<UsageWindow>,
@@ -57,7 +67,7 @@ pub struct UsageRateLimit {
     pub secondary_window: Option<UsageWindow>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UsageWindow {
     #[serde(default)]
     pub used_percent: Option<f64>,
@@ -102,7 +112,10 @@ impl UsageRateLimit {
 
 #[cfg(test)]
 mod usage_tests {
-    use super::{CreditAmount, RateLimitResetCredits, UsageResponse};
+    use super::{
+        CreditAmount, ModelUsageDay, ModelUsageItem, ModelUsageResponse, ModelUsageTotal,
+        RateLimitResetCredits, TokenUsageResponse, UsageResponse,
+    };
 
     #[test]
     fn identifies_weekly_only_primary_window() {
@@ -175,9 +188,131 @@ mod usage_tests {
             Some("2026-08-12T18:09:35Z")
         );
     }
+
+    #[test]
+    fn parses_and_aggregates_daily_model_usage() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{
+                "model_usage": {
+                    "units": "percent",
+                    "group_by": "day",
+                    "data": [
+                        {"date":"2026-09-03","models":[
+                            {"model":"gpt-5.6-sol","speed":"standard","credits":4.5},
+                            {"model":"gpt-5.6-luna","speed":"fast","credits":"2.5"},
+                            {"model":"ignored-zero","speed":"standard","credits":0}
+                        ]},
+                        {"date":"2026-09-04","models":[
+                            {"model":"gpt-5.6-sol","speed":"standard","credits":3.0},
+                            {"model":"gpt-5.6-luna","speed":"fast","credits":null},
+                            {"model":"other","speed":null,"credits":-1},
+                            {"model":null,"speed":"standard","credits":1},
+                            {"model":"bad-number","speed":"standard","credits":"not-a-number"}
+                        ]}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let model_usage = usage.model_usage.unwrap();
+        assert_eq!(model_usage.units.as_deref(), Some("percent"));
+        assert_eq!(model_usage.group_by.as_deref(), Some("day"));
+        assert_eq!(model_usage.day_count(), 2);
+        let daily = model_usage.daily_totals();
+        assert_eq!(daily.len(), 2);
+        assert_eq!(daily[0].date, "2026-09-03");
+        assert_eq!(daily[0].models[0].model, "gpt-5.6-sol");
+        assert_eq!(daily[0].models[0].credits, 4.5);
+        assert_eq!(daily[1].models[0].credits, 3.0);
+        assert_eq!(
+            model_usage.totals(),
+            vec![
+                ModelUsageTotal {
+                    model: "gpt-5.6-sol".to_string(),
+                    speed: Some("standard".to_string()),
+                    credits: 7.5,
+                },
+                ModelUsageTotal {
+                    model: "gpt-5.6-luna".to_string(),
+                    speed: Some("fast".to_string()),
+                    credits: 2.5,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn model_usage_handles_missing_data_and_blank_labels() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"model_usage":{"data":[{"models":null},{"date":"  ","models":[]},{"models":[{"model":"valid","speed":"  ","credits":1},{"model":"  ","speed":"standard","credits":1}]}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(usage.model_usage.as_ref().unwrap().day_count(), 3);
+        assert_eq!(
+            usage.model_usage.unwrap().totals(),
+            vec![ModelUsageTotal {
+                model: "valid".to_string(),
+                speed: None,
+                credits: 1.0,
+            }]
+        );
+
+        let non_finite = ModelUsageResponse {
+            data: vec![ModelUsageDay {
+                date: Some("2026-09-05".to_string()),
+                models: Some(vec![ModelUsageItem {
+                    model: Some("nan".to_string()),
+                    speed: None,
+                    credits: Some(CreditAmount::Number(f64::NAN)),
+                }]),
+            }],
+            ..ModelUsageResponse::default()
+        };
+        assert!(non_finite.totals().is_empty());
+    }
+
+    #[test]
+    fn parses_and_sums_daily_token_usage() {
+        let usage: UsageResponse = serde_json::from_value(serde_json::json!({
+            "token_usage": {
+                "summary": {"lifetimeTokens": 9000, "peakDailyTokens": 700},
+                "dailyUsageBuckets": [
+                    {"startDate":"2026-09-03","tokens":500},
+                    {"startDate":"2026-09-04","tokens":null},
+                    {"startDate":"2026-09-05","tokens":1200}
+                ]
+            }
+        }))
+        .unwrap();
+
+        let token_usage = usage.token_usage.unwrap();
+        assert_eq!(token_usage.day_count(), 3);
+        assert_eq!(token_usage.total_daily_tokens(), 1700);
+        assert_eq!(token_usage.peak_daily_tokens(), Some(700));
+        assert_eq!(token_usage.daily_buckets()[0].start_date, "2026-09-03");
+    }
+
+    #[test]
+    fn token_usage_handles_missing_summary_and_buckets() {
+        let token_usage: TokenUsageResponse =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert_eq!(token_usage.day_count(), 0);
+        assert_eq!(token_usage.total_daily_tokens(), 0);
+        assert_eq!(token_usage.peak_daily_tokens(), None);
+        assert!(token_usage.daily_buckets().is_empty());
+
+        let token_usage: TokenUsageResponse = serde_json::from_value(serde_json::json!({
+            "dailyUsageBuckets": [{"startDate":"2026-09-05","tokens":250}]
+        }))
+        .unwrap();
+        assert_eq!(token_usage.peak_daily_tokens(), Some(250));
+    }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SpendControl {
     #[serde(default)]
     pub individual_limit: Option<MonthlyCreditLimit>,
@@ -185,7 +320,7 @@ pub struct SpendControl {
     pub reached: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MonthlyCreditLimit {
     #[serde(default)]
     pub limit: Option<CreditAmount>,
@@ -205,7 +340,7 @@ pub struct MonthlyCreditLimit {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum CreditAmount {
     Number(f64),
@@ -221,7 +356,198 @@ impl CreditAmount {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct ModelUsageResponse {
+    #[serde(default)]
+    pub units: Option<String>,
+    #[serde(default)]
+    pub group_by: Option<String>,
+    #[serde(default)]
+    pub data: Vec<ModelUsageDay>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct ModelUsageDay {
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub models: Option<Vec<ModelUsageItem>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ModelUsageItem {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub speed: Option<String>,
+    #[serde(default)]
+    pub credits: Option<CreditAmount>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelUsageTotal {
+    pub model: String,
+    pub speed: Option<String>,
+    pub credits: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelUsageDayTotal {
+    pub date: String,
+    pub models: Vec<ModelUsageTotal>,
+}
+
+impl ModelUsageResponse {
+    pub fn totals(&self) -> Vec<ModelUsageTotal> {
+        use std::collections::BTreeMap;
+
+        let mut totals = BTreeMap::<(String, String), f64>::new();
+        for day in &self.data {
+            for total in aggregate_model_items(day.models.as_deref().unwrap_or_default()) {
+                *totals
+                    .entry((total.model, total.speed.unwrap_or_default()))
+                    .or_default() += total.credits;
+            }
+        }
+
+        sort_model_totals(totals)
+    }
+
+    pub fn daily_totals(&self) -> Vec<ModelUsageDayTotal> {
+        self.data
+            .iter()
+            .filter_map(|day| {
+                let date = day.date.as_deref()?.trim();
+                if date.is_empty() {
+                    return None;
+                }
+
+                Some(ModelUsageDayTotal {
+                    date: date.to_string(),
+                    models: aggregate_model_items(day.models.as_deref().unwrap_or_default()),
+                })
+            })
+            .collect()
+    }
+
+    pub fn day_count(&self) -> usize {
+        self.data.len()
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageResponse {
+    #[serde(default)]
+    pub summary: Option<TokenUsageSummary>,
+    #[serde(default)]
+    pub daily_usage_buckets: Option<Vec<TokenUsageDailyBucket>>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageSummary {
+    #[serde(default)]
+    pub lifetime_tokens: Option<u64>,
+    #[serde(default)]
+    pub peak_daily_tokens: Option<u64>,
+    #[serde(default)]
+    pub longest_running_turn_sec: Option<u64>,
+    #[serde(default)]
+    pub current_streak_days: Option<u64>,
+    #[serde(default)]
+    pub longest_streak_days: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageDailyBucket {
+    #[serde(default)]
+    pub start_date: String,
+    #[serde(default)]
+    pub tokens: Option<u64>,
+}
+
+impl TokenUsageResponse {
+    pub fn daily_buckets(&self) -> &[TokenUsageDailyBucket] {
+        self.daily_usage_buckets.as_deref().unwrap_or_default()
+    }
+
+    pub fn day_count(&self) -> usize {
+        self.daily_buckets().len()
+    }
+
+    pub fn total_daily_tokens(&self) -> u64 {
+        self.daily_buckets()
+            .iter()
+            .filter_map(|bucket| bucket.tokens)
+            .fold(0, |total, tokens| total.saturating_add(tokens))
+    }
+
+    pub fn peak_daily_tokens(&self) -> Option<u64> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.peak_daily_tokens)
+            .or_else(|| {
+                self.daily_buckets()
+                    .iter()
+                    .filter_map(|bucket| bucket.tokens)
+                    .max()
+            })
+    }
+}
+
+fn aggregate_model_items(items: &[ModelUsageItem]) -> Vec<ModelUsageTotal> {
+    use std::collections::BTreeMap;
+
+    let mut totals = BTreeMap::<(String, String), f64>::new();
+    for item in items {
+        let Some(model) = item
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            continue;
+        };
+        let Some(credits) = item.credits.as_ref().and_then(CreditAmount::as_f64) else {
+            continue;
+        };
+        if !credits.is_finite() || credits <= 0.0 {
+            continue;
+        }
+
+        let speed = item.speed.as_deref().unwrap_or_default().trim();
+        *totals
+            .entry((model.to_string(), speed.to_string()))
+            .or_default() += credits;
+    }
+
+    sort_model_totals(totals)
+}
+
+fn sort_model_totals(
+    totals: std::collections::BTreeMap<(String, String), f64>,
+) -> Vec<ModelUsageTotal> {
+    let mut totals = totals
+        .into_iter()
+        .map(|((model, speed), credits)| ModelUsageTotal {
+            model,
+            speed: (!speed.is_empty()).then_some(speed),
+            credits,
+        })
+        .collect::<Vec<_>>();
+    totals.sort_by(|left, right| {
+        right
+            .credits
+            .total_cmp(&left.credits)
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.speed.cmp(&right.speed))
+    });
+    totals
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UsageCredits {
     #[serde(default)]
     pub balance: Option<CreditAmount>,
@@ -233,7 +559,7 @@ pub struct UsageCredits {
     pub overage_limit_reached: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct RateLimitResetCredits {
     #[serde(default)]
     pub available_count: Option<u64>,
@@ -245,7 +571,7 @@ pub struct RateLimitResetCredits {
     pub credits: Vec<RateLimitResetCredit>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RateLimitResetCredit {
     #[serde(default)]
     pub status: Option<String>,
@@ -259,7 +585,7 @@ pub struct RateLimitResetCredit {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum ResetAt {
     Epoch(u64),
@@ -553,6 +879,10 @@ pub struct TrackedSession {
     pub rate_limit: Option<TrackedRateLimit>,
     #[serde(default)]
     pub monthly_usage: Option<TrackedMonthlyUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<UsageResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fetched_at: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]

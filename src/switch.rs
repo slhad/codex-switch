@@ -678,12 +678,14 @@ mod tests {
         let previous_live = r#"{"tokens":{"id_token":"previous","account_id":"acct-prev"}}"#;
         std::fs::write(&ctx.live_auth, original_live).unwrap();
 
-        let mut tracker = AccountTracker::default();
-        tracker.last_snapshot = Some(TrackedAuthSnapshot {
-            auth_json: previous_live.to_string(),
-            observed_at: Some("2026-06-15T00:00:00Z".to_string()),
-            profile: Some("work".to_string()),
-        });
+        let tracker = AccountTracker {
+            last_snapshot: Some(TrackedAuthSnapshot {
+                auth_json: previous_live.to_string(),
+                observed_at: Some("2026-06-15T00:00:00Z".to_string()),
+                profile: Some("work".to_string()),
+            }),
+            ..AccountTracker::default()
+        };
         save_tracker(&ctx, &tracker);
 
         let restored = restore_last_snapshot(&ctx);
@@ -742,7 +744,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            &ctx.pi_profile_path("me"),
+            ctx.pi_profile_path("me"),
             r#"{"openai-codex":{"type":"oauth","access":"pi-target"}}"#,
         )
         .unwrap();

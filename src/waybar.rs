@@ -1,13 +1,19 @@
 use crate::data::{
-    read_auth, read_pi_auth, AuthFile, Context, PiOpenAiCodexAuth, TrackedQuotaHit, UsageResponse,
+    read_auth, read_pi_auth, AccountTracker, AuthFile, Context, CreditAmount, MonthlyCreditLimit,
+    PiOpenAiCodexAuth, ResetAt, SpendControl, TrackedMonthlyUsage, TrackedQuotaHit, TrackedSession,
+    UsageRateLimit, UsageResponse, UsageWindow,
 };
 use crate::jwt::{extract_email, extract_email_from_token};
 use crate::profile::{detect_current_profile, list_pi_profiles, list_profiles, profile_name};
 use crate::rate_limit::{
-    fetch_pi_rate_limit, fetch_pi_rate_limit_for_path, fetch_rate_limit_for_auth_path,
-    format_credit_amount, format_duration_until, parse_reset_at, summarize_reset, summarize_window,
+    fetch_model_usage_for_auth, fetch_pi_model_usage_for_auth, fetch_pi_rate_limit,
+    fetch_pi_rate_limit_for_path, fetch_pi_token_usage_for_auth, fetch_rate_limit_for_auth_path,
+    fetch_token_usage_for_auth, format_credit_amount, format_duration_until, parse_reset_at,
+    summarize_reset, summarize_window,
 };
-use crate::tracker::{load_tracker, save_tracker, update_monthly_usage, update_rate_limit};
+use crate::tracker::{
+    load_tracker, save_tracker, update_monthly_usage, update_rate_limit, update_usage_cache,
+};
 use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 
@@ -124,7 +130,24 @@ fn display_entry<'a>(
 }
 
 pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
+    collect_profile_usage_with_options(ctx, false, false)
+}
+
+pub(crate) fn collect_profile_usage_with_model_usage(ctx: &Context) -> Vec<ProfileUsage> {
+    collect_profile_usage_with_options(ctx, true, false)
+}
+
+pub(crate) fn collect_profile_usage_with_model_and_token_usage(ctx: &Context) -> Vec<ProfileUsage> {
+    collect_profile_usage_with_options(ctx, true, true)
+}
+
+fn collect_profile_usage_with_options(
+    ctx: &Context,
+    include_model_usage: bool,
+    include_token_usage: bool,
+) -> Vec<ProfileUsage> {
     let mut entries = Vec::new();
+    let tracker = load_tracker(ctx);
     let live_bytes = std::fs::read(&ctx.live_auth).ok();
     let live_auth = if ctx.live_auth.exists() {
         std::panic::catch_unwind(|| read_auth(&ctx.live_auth)).ok()
@@ -135,7 +158,6 @@ pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
 
     if ctx.live_auth.exists() {
         let current_profile = detect_current_profile(ctx).unwrap_or_else(|| "live".to_string());
-        let usage = fetch_rate_limit_for_auth_path(&ctx.live_auth).map(|(usage, _)| usage);
         let email = live_auth
             .as_ref()
             .and_then(extract_email)
@@ -143,6 +165,21 @@ pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
         let account_id = live_auth
             .as_ref()
             .and_then(|auth| auth.tokens.account_id.clone());
+        let usage = usage_or_cached(
+            fetch_rate_limit_for_auth_path(&ctx.live_auth).map(|(mut usage, auth)| {
+                if include_model_usage {
+                    usage.model_usage = fetch_model_usage_for_auth(&auth).ok();
+                }
+                if include_token_usage {
+                    usage.token_usage = fetch_token_usage_for_auth(&auth).ok();
+                }
+                usage
+            }),
+            &tracker,
+            "codex:live",
+            account_id.as_deref(),
+            &email,
+        );
         entries.push(ProfileUsage {
             provider: "codex",
             session_id: "codex:live".to_string(),
@@ -171,13 +208,28 @@ pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
             .as_ref()
             .and_then(extract_email)
             .unwrap_or_else(|| "?".to_string());
-        let usage = fetch_rate_limit_for_auth_path(&path).map(|(usage, _)| usage);
         let account_id = auth
             .as_ref()
             .and_then(|auth| auth.tokens.account_id.clone());
+        let session_id = format!("codex:profile:{}", name);
+        let usage = usage_or_cached(
+            fetch_rate_limit_for_auth_path(&path).map(|(mut usage, auth)| {
+                if include_model_usage {
+                    usage.model_usage = fetch_model_usage_for_auth(&auth).ok();
+                }
+                if include_token_usage {
+                    usage.token_usage = fetch_token_usage_for_auth(&auth).ok();
+                }
+                usage
+            }),
+            &tracker,
+            &session_id,
+            account_id.as_deref(),
+            &email,
+        );
         entries.push(ProfileUsage {
             provider: "codex",
-            session_id: format!("codex:profile:{}", name),
+            session_id,
             name,
             email,
             account_id,
@@ -187,13 +239,30 @@ pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
     }
 
     if let Some(pi_auth) = live_pi.as_ref() {
-        let usage = fetch_pi_rate_limit(ctx, pi_auth.clone()).map(|(usage, _)| usage);
+        let name = detect_pi_profile(ctx, pi_auth);
+        let email = extract_email_from_token(&pi_auth.access).unwrap_or_else(|| "?".to_string());
+        let account_id = pi_auth.account_id.clone();
+        let usage = usage_or_cached(
+            fetch_pi_rate_limit(ctx, pi_auth.clone()).map(|(mut usage, auth)| {
+                if include_model_usage {
+                    usage.model_usage = fetch_pi_model_usage_for_auth(&auth).ok();
+                }
+                if include_token_usage {
+                    usage.token_usage = fetch_pi_token_usage_for_auth(&auth).ok();
+                }
+                usage
+            }),
+            &tracker,
+            "pi:openai-codex",
+            account_id.as_deref(),
+            &email,
+        );
         entries.push(ProfileUsage {
             provider: "pi",
             session_id: "pi:openai-codex".to_string(),
-            name: detect_pi_profile(ctx, pi_auth),
-            email: extract_email_from_token(&pi_auth.access).unwrap_or_else(|| "?".to_string()),
-            account_id: pi_auth.account_id.clone(),
+            name,
+            email,
+            account_id,
             is_live: true,
             usage,
         });
@@ -210,19 +279,195 @@ pub(crate) fn collect_profile_usage(ctx: &Context) -> Vec<ProfileUsage> {
             continue;
         }
         let name = profile_name(&path);
-        let usage = fetch_pi_rate_limit_for_path(&path, pi_auth.clone()).map(|(usage, _)| usage);
+        let email = extract_email_from_token(&pi_auth.access).unwrap_or_else(|| "?".to_string());
+        let account_id = pi_auth.account_id.clone();
+        let session_id = format!("pi:profile:{}", name);
+        let usage = usage_or_cached(
+            fetch_pi_rate_limit_for_path(&path, pi_auth.clone()).map(|(mut usage, auth)| {
+                if include_model_usage {
+                    usage.model_usage = fetch_pi_model_usage_for_auth(&auth).ok();
+                }
+                if include_token_usage {
+                    usage.token_usage = fetch_pi_token_usage_for_auth(&auth).ok();
+                }
+                usage
+            }),
+            &tracker,
+            &session_id,
+            account_id.as_deref(),
+            &email,
+        );
         entries.push(ProfileUsage {
             provider: "pi",
-            session_id: format!("pi:profile:{}", name),
+            session_id,
             name,
-            email: extract_email_from_token(&pi_auth.access).unwrap_or_else(|| "?".to_string()),
-            account_id: pi_auth.account_id.clone(),
+            email,
+            account_id,
             is_live: false,
             usage,
         });
     }
 
     entries
+}
+
+/// Keep display clients useful during a temporary usage API failure while
+/// refusing to show another account's quota after a profile switch.
+pub(crate) fn usage_or_cached(
+    result: Result<UsageResponse, String>,
+    tracker: &AccountTracker,
+    session_id: &str,
+    account_id: Option<&str>,
+    email: &str,
+) -> Result<UsageResponse, String> {
+    match result {
+        Ok(mut usage) => {
+            usage.last_fetched_at = Some(Utc::now().to_rfc3339());
+            Ok(usage)
+        }
+        Err(error) => {
+            let Some(mut usage) = cached_usage(tracker, session_id, account_id, email) else {
+                return Err(error);
+            };
+            usage.cached = true;
+            usage.cache_error = Some(error);
+            Ok(usage)
+        }
+    }
+}
+
+fn cached_usage(
+    tracker: &AccountTracker,
+    session_id: &str,
+    account_id: Option<&str>,
+    email: &str,
+) -> Option<UsageResponse> {
+    let session = tracker
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)?;
+    if !same_cached_identity(session, account_id, email) {
+        return None;
+    }
+
+    let usage = session
+        .last_usage
+        .clone()
+        .or_else(|| legacy_usage(session))?;
+    let mut usage = usage;
+    usage.last_fetched_at = session
+        .last_fetched_at
+        .clone()
+        .or_else(|| {
+            session
+                .monthly_usage
+                .as_ref()
+                .and_then(|usage| usage.observed_at.clone())
+        })
+        .or_else(|| {
+            session
+                .rate_limit
+                .as_ref()
+                .and_then(|usage| usage.observed_at.clone())
+        });
+    has_display_data(&usage).then_some(usage)
+}
+
+fn same_cached_identity(session: &TrackedSession, account_id: Option<&str>, email: &str) -> bool {
+    let current_account_id = account_id.filter(|value| !value.is_empty());
+    let cached_account_id = (!session.account_id.is_empty()).then_some(session.account_id.as_str());
+
+    if let (Some(current), Some(cached)) = (current_account_id, cached_account_id) {
+        return current == cached;
+    }
+
+    usable_email(email)
+        .zip(session.email.as_deref().and_then(usable_email))
+        .is_some_and(|(current, cached)| current.eq_ignore_ascii_case(cached))
+}
+
+fn usable_email(email: &str) -> Option<&str> {
+    (!email.is_empty() && email != "?").then_some(email)
+}
+
+fn legacy_usage(session: &TrackedSession) -> Option<UsageResponse> {
+    if let Some(monthly) = session.monthly_usage.as_ref() {
+        return Some(UsageResponse {
+            plan_type: monthly.plan_type.clone(),
+            rate_limit: None,
+            spend_control: Some(SpendControl {
+                individual_limit: Some(MonthlyCreditLimit {
+                    limit: monthly.limit.map(CreditAmount::Number),
+                    used: monthly.used.map(CreditAmount::Number),
+                    remaining: monthly.remaining.map(CreditAmount::Number),
+                    used_percent: monthly.used_percent,
+                    remaining_percent: monthly.remaining_percent,
+                    reset_after_seconds: None,
+                    reset_at: monthly.resets_at.map(ResetAt::Epoch),
+                    source: None,
+                }),
+                reached: monthly.reached,
+            }),
+            credits: None,
+            rate_limit_reset_credits: None,
+            model_usage: None,
+            token_usage: None,
+            cached: false,
+            cache_error: None,
+            last_fetched_at: None,
+        });
+    }
+
+    let rate = session.rate_limit.as_ref()?;
+    let primary = (rate.resets_at != 0 || rate.used_percent.is_some()).then(|| UsageWindow {
+        used_percent: rate.used_percent,
+        reset_at: (rate.resets_at != 0).then_some(ResetAt::Epoch(rate.resets_at)),
+        limit_window_seconds: Some(18_000),
+    });
+    let secondary = (rate.secondary_used_percent.is_some()
+        || rate
+            .secondary_resets_at
+            .is_some_and(|reset_at| reset_at != 0))
+    .then(|| UsageWindow {
+        used_percent: rate.secondary_used_percent,
+        reset_at: rate
+            .secondary_resets_at
+            .filter(|reset_at| *reset_at != 0)
+            .map(ResetAt::Epoch),
+        limit_window_seconds: Some(604_800),
+    });
+
+    (primary.is_some() || secondary.is_some()).then_some(UsageResponse {
+        plan_type: rate.plan_type.clone(),
+        rate_limit: Some(UsageRateLimit {
+            primary_window: primary,
+            secondary_window: secondary,
+        }),
+        spend_control: None,
+        credits: None,
+        rate_limit_reset_credits: None,
+        model_usage: None,
+        token_usage: None,
+        cached: false,
+        cache_error: None,
+        last_fetched_at: None,
+    })
+}
+
+fn has_display_data(usage: &UsageResponse) -> bool {
+    usage.five_hour_window().is_some()
+        || usage.weekly_window().is_some()
+        || usage.monthly_limit().is_some()
+        || usage.model_usage.is_some()
+        || usage.token_usage.is_some()
+        || usage
+            .rate_limit_reset_credits
+            .as_ref()
+            .is_some_and(|credits| {
+                credits.available_count.is_some()
+                    || credits.applicable_available_count.is_some()
+                    || !credits.credits.is_empty()
+            })
 }
 
 fn same_pi_account(a: &PiOpenAiCodexAuth, b: &PiOpenAiCodexAuth) -> bool {
@@ -281,10 +526,28 @@ pub(crate) fn update_last_quota_hit(
 
     for entry in entries {
         let Ok(usage) = &entry.usage else { continue };
-        let previous_session = tracker
+        if usage.cached {
+            continue;
+        }
+        let stored_session = tracker
             .sessions
             .iter()
             .find(|session| session.session_id == entry.session_id);
+        let account_changed = entry.is_live
+            && stored_session.is_some_and(|session| {
+                !same_cached_identity(session, entry.account_id.as_deref(), &entry.email)
+                    && (!session.account_id.is_empty()
+                        || session.email.as_deref().and_then(usable_email).is_some())
+                    && (entry
+                        .account_id
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .is_some()
+                        || usable_email(&entry.email).is_some())
+            });
+        let previous_session = stored_session.filter(|session| {
+            same_cached_identity(session, entry.account_id.as_deref(), &entry.email)
+        });
         let previous_rate = previous_session.and_then(|session| session.rate_limit.as_ref());
         let previous_monthly = previous_session.and_then(|session| session.monthly_usage.as_ref());
 
@@ -298,10 +561,7 @@ pub(crate) fn update_last_quota_hit(
         let mut previous_used = None;
         let mut current_used = None;
 
-        if usage_increased(
-            previous_monthly.and_then(|value| value.used_percent),
-            monthly_used,
-        ) {
+        if monthly_usage_increased(previous_monthly, monthly) {
             hit_window = Some("month".to_string());
             previous_used = previous_monthly.and_then(|value| value.used_percent);
             current_used = monthly_used;
@@ -319,6 +579,17 @@ pub(crate) fn update_last_quota_hit(
             hit_window = Some("7d".to_string());
             previous_used = previous_rate.and_then(|rate| rate.secondary_used_percent);
             current_used = secondary_used;
+        } else if account_changed {
+            if monthly.is_some() {
+                hit_window = Some("month".to_string());
+                current_used = monthly_used;
+            } else if primary_used.is_some() || primary.is_some() {
+                hit_window = Some("5h".to_string());
+                current_used = primary_used;
+            } else if secondary_used.is_some() || secondary.is_some() {
+                hit_window = Some("7d".to_string());
+                current_used = secondary_used;
+            }
         }
 
         if let Some(window) = hit_window {
@@ -355,6 +626,7 @@ pub(crate) fn update_last_quota_hit(
             false,
             None,
         );
+        update_usage_cache(session, usage);
         if let Some(monthly) = monthly {
             update_monthly_usage(
                 session,
@@ -391,6 +663,22 @@ fn usage_increased(previous: Option<f64>, current: Option<f64>) -> bool {
         (Some(previous), Some(current)) => current > previous + 0.01,
         _ => false,
     }
+}
+
+fn monthly_usage_increased(
+    previous: Option<&TrackedMonthlyUsage>,
+    current: Option<&MonthlyCreditLimit>,
+) -> bool {
+    let Some(current) = current else { return false };
+    let current_used = current.used.as_ref().and_then(|value| value.as_f64());
+    if usage_increased(previous.and_then(|value| value.used), current_used) {
+        return true;
+    }
+
+    usage_increased(
+        previous.and_then(|value| value.used_percent),
+        current.used_percent,
+    )
 }
 
 fn format_entry(
@@ -483,10 +771,10 @@ fn format_entry_with_options(
             }
         }
     }
-    values.status = if entry.usage.is_ok() {
-        "ok"
-    } else {
-        "unavailable"
+    values.status = match &entry.usage {
+        Ok(usage) if usage.cached => "stale",
+        Ok(_) => "ok",
+        Err(_) => "unavailable",
     }
     .to_string();
     values.profile = entry.name.clone();
@@ -534,8 +822,8 @@ fn compact_reset(
     reset
         .split_whitespace()
         .filter(|part| {
-            !(hide_minutes_with_days && part.ends_with('m'))
-                && !(hide_hours_with_days && part.ends_with('h'))
+            !(hide_minutes_with_days && part.ends_with('m')
+                || hide_hours_with_days && part.ends_with('h'))
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -753,12 +1041,11 @@ fn value_or_unknown(value: &str) -> &str {
 }
 
 fn same_codex_account(a: &AuthFile, b: &AuthFile) -> bool {
-    match (
+    if let (Some(a_id), Some(b_id)) = (
         a.tokens.account_id.as_deref().filter(|id| !id.is_empty()),
         b.tokens.account_id.as_deref().filter(|id| !id.is_empty()),
     ) {
-        (Some(a_id), Some(b_id)) => return a_id == b_id,
-        _ => {}
+        return a_id == b_id;
     }
 
     match (extract_email(a), extract_email(b)) {
@@ -849,38 +1136,45 @@ fn format_tooltip(entries: &[ProfileUsage], last_hit: Option<&TrackedQuotaHit>) 
     }
     for entry in unique_usage_accounts(entries) {
         match &entry.usage {
-            Ok(usage) if usage.monthly_limit().is_some() => lines.push(format!(
-                "{}: month {} / {} credits used ({}%) | {} credits left ({}%) | reset {} | limit reached {}",
-                entry.name,
-                format_entry("{monthly_used}", entry, last_hit),
-                format_entry("{monthly_limit}", entry, last_hit),
-                format_entry("{monthly_used_pct}", entry, last_hit),
-                format_entry("{monthly_remaining}", entry, last_hit),
-                format_entry("{monthly_remaining_pct}", entry, last_hit),
-                format_entry("{monthly_reset}", entry, last_hit),
-                usage
-                    .spend_control
-                    .as_ref()
-                    .and_then(|value| value.reached)
-                    .map(|value| if value { "yes" } else { "no" })
-                    .unwrap_or("?"),
-            )),
+            Ok(usage) if usage.monthly_limit().is_some() => {
+                let cached = if usage.cached { " (cached)" } else { "" };
+                lines.push(format!(
+                    "{}: month {} / {} credits used ({}%) | {} credits left ({}%) | reset {} | limit reached {}{}",
+                    entry.name,
+                    format_entry("{monthly_used}", entry, last_hit),
+                    format_entry("{monthly_limit}", entry, last_hit),
+                    format_entry("{monthly_used_pct}", entry, last_hit),
+                    format_entry("{monthly_remaining}", entry, last_hit),
+                    format_entry("{monthly_remaining_pct}", entry, last_hit),
+                    format_entry("{monthly_reset}", entry, last_hit),
+                    usage
+                        .spend_control
+                        .as_ref()
+                        .and_then(|value| value.reached)
+                        .map(|value| if value { "yes" } else { "no" })
+                        .unwrap_or("?"),
+                    cached,
+                ));
+            }
             Ok(_) => {
                 let five_hour_pct = format_entry("{5h_pct}", entry, last_hit);
                 let five_hour_reset = format_entry("{5h_reset}", entry, last_hit);
                 let mut windows = Vec::new();
                 if five_hour_pct != "?" || five_hour_reset != "?" {
-                    windows.push(format!(
-                        "5h {}% reset {}",
-                        five_hour_pct, five_hour_reset
-                    ));
+                    windows.push(format!("5h {}% reset {}", five_hour_pct, five_hour_reset));
                 }
                 windows.push(format!(
                     "7d {}% reset {}",
                     format_entry("{7d_pct}", entry, last_hit),
                     format_entry("{7d_reset}", entry, last_hit),
                 ));
-                lines.push(format!("{}: {}", entry.name, windows.join(" | ")));
+                let cached = entry.usage.as_ref().is_ok_and(|usage| usage.cached);
+                lines.push(format!(
+                    "{}: {}{}",
+                    entry.name,
+                    windows.join(" | "),
+                    if cached { " (cached)" } else { "" },
+                ));
             }
             Err(err) => lines.push(format!("{}: unavailable ({})", entry.name, err)),
         }
@@ -916,10 +1210,39 @@ fn format_alt(
 mod tests {
     use super::{
         apply_last_hit, class_for_percentage, compact_reset, display_entry, entry_percentage,
-        format_entry, format_entry_with_options, format_tooltip, same_codex_account,
-        same_pi_account, FormatValues, ProfileUsage, DEFAULT_FORMAT, ICON, TIME_ICON,
+        format_entry, format_entry_with_options, format_tooltip, monthly_usage_increased,
+        parse_reset_at, same_codex_account, same_pi_account, update_last_quota_hit,
+        usage_or_cached, FormatValues, ProfileUsage, DEFAULT_FORMAT, ICON, TIME_ICON,
     };
-    use crate::data::{AuthFile, PiOpenAiCodexAuth, Tokens, TrackedQuotaHit, UsageResponse};
+    use crate::data::{
+        AccountTracker, AuthFile, Context, MonthlyCreditLimit, PiOpenAiCodexAuth, Tokens,
+        TrackedMonthlyUsage, TrackedQuotaHit, TrackedRateLimit, TrackedSession, UsageResponse,
+    };
+    use crate::tracker::save_tracker;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_context(name: &str) -> (Context, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "codex-switch-waybar-{}-{}-{}",
+            name,
+            std::process::id(),
+            unique
+        ));
+        let state_dir = base.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let ctx = Context {
+            live_auth: base.join("auth.json"),
+            pi_auth: base.join("pi-auth.json"),
+            state_dir: state_dir.clone(),
+            tracker_file: state_dir.join("accounts.json"),
+        };
+        (ctx, base)
+    }
 
     #[test]
     fn waybar_format_replaces_codex_usage_tokens() {
@@ -1068,6 +1391,70 @@ mod tests {
         assert!(tooltip.contains("month 94.48 / 12500 credits used (1%)"));
         assert!(tooltip.contains("12405.52 credits left (99%)"));
         assert!(tooltip.contains("limit reached no"));
+    }
+
+    #[test]
+    fn monthly_usage_hit_uses_credit_amount_when_percent_is_unchanged() {
+        let previous = TrackedMonthlyUsage {
+            used: Some(100.0),
+            used_percent: Some(1.0),
+            ..TrackedMonthlyUsage::default()
+        };
+        let current: MonthlyCreditLimit =
+            serde_json::from_str(r#"{"used":"100.25","used_percent":1,"remaining_percent":99}"#)
+                .unwrap();
+
+        assert!(monthly_usage_increased(Some(&previous), Some(&current)));
+    }
+
+    #[test]
+    fn account_switch_updates_last_quota_hit_without_comparing_old_account() {
+        let (ctx, base) = test_context("last-hit-switch");
+        save_tracker(
+            &ctx,
+            &AccountTracker {
+                sessions: vec![TrackedSession {
+                    session_id: "codex:live".to_string(),
+                    account_id: "account-me".to_string(),
+                    profile: Some("me".to_string()),
+                    email: Some("me@example.com".to_string()),
+                    rate_limit: Some(TrackedRateLimit {
+                        used_percent: Some(80.0),
+                        resets_at: 4_102_444_800,
+                        ..TrackedRateLimit::default()
+                    }),
+                    ..TrackedSession::default()
+                }],
+                last_quota_hit: Some(TrackedQuotaHit {
+                    profile: Some("me".to_string()),
+                    ..TrackedQuotaHit::default()
+                }),
+                ..AccountTracker::default()
+            },
+        );
+
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":18000,"reset_at":4102444800}}}"#,
+        )
+        .unwrap();
+        let hit = update_last_quota_hit(
+            &ctx,
+            &[ProfileUsage {
+                provider: "codex",
+                session_id: "codex:live".to_string(),
+                name: "mate".to_string(),
+                email: "mate@example.com".to_string(),
+                account_id: Some("account-mate".to_string()),
+                is_live: true,
+                usage: Ok(usage),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(hit.profile.as_deref(), Some("mate"));
+        assert_eq!(hit.used_percent, Some(20.0));
+        assert!(hit.previous_used_percent.is_none());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -1280,6 +1667,171 @@ mod tests {
         };
 
         assert_eq!(display_entry(&entries, Some(&hit)).unwrap().name, "me");
+    }
+
+    #[test]
+    fn waybar_uses_matching_cached_usage_after_refresh_failure() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":42,"reset_at":4102444800,"limit_window_seconds":18000},"secondary_window":{"used_percent":12,"reset_at":4102444800,"limit_window_seconds":604800}}}"#,
+        )
+        .unwrap();
+        let tracker = AccountTracker {
+            sessions: vec![TrackedSession {
+                session_id: "codex:live".to_string(),
+                account_id: "acct-me".to_string(),
+                email: Some("me@example.com".to_string()),
+                last_fetched_at: Some("2026-09-02T10:00:00Z".to_string()),
+                last_usage: Some(usage),
+                ..TrackedSession::default()
+            }],
+            ..AccountTracker::default()
+        };
+
+        let cached = usage_or_cached(
+            Err("network unavailable".to_string()),
+            &tracker,
+            "codex:live",
+            Some("acct-me"),
+            "me@example.com",
+        )
+        .unwrap();
+
+        assert!(cached.cached);
+        assert_eq!(cached.cache_error.as_deref(), Some("network unavailable"));
+        assert_eq!(
+            cached.last_fetched_at.as_deref(),
+            Some("2026-09-02T10:00:00Z")
+        );
+        assert_eq!(cached.five_hour_window().unwrap().used_percent, Some(42.0));
+        assert_eq!(cached.weekly_window().unwrap().used_percent, Some(12.0));
+        let entry = ProfileUsage {
+            provider: "codex",
+            session_id: "codex:live".to_string(),
+            name: "me".to_string(),
+            email: "me@example.com".to_string(),
+            account_id: Some("acct-me".to_string()),
+            is_live: true,
+            usage: Ok(cached),
+        };
+        let formatted = format_entry("{5h_pct} {5h_reset} {status}", &entry, None);
+        assert!(formatted.starts_with("42 "));
+        assert!(formatted.ends_with(" stale"));
+    }
+
+    #[test]
+    fn waybar_marks_successful_usage_with_fetch_time() {
+        let usage: UsageResponse =
+            serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":42}}}"#)
+                .unwrap();
+
+        let fetched = usage_or_cached(
+            Ok(usage),
+            &AccountTracker::default(),
+            "codex:live",
+            Some("acct-me"),
+            "me@example.com",
+        )
+        .unwrap();
+
+        assert!(fetched
+            .last_fetched_at
+            .as_ref()
+            .is_some_and(|value| { chrono::DateTime::parse_from_rfc3339(value).is_ok() }));
+    }
+
+    #[test]
+    fn waybar_does_not_reuse_cache_for_another_account() {
+        let usage: UsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":42,"reset_at":4102444800}}}"#,
+        )
+        .unwrap();
+        let tracker = AccountTracker {
+            sessions: vec![TrackedSession {
+                session_id: "codex:live".to_string(),
+                account_id: "acct-old".to_string(),
+                email: Some("old@example.com".to_string()),
+                last_usage: Some(usage),
+                ..TrackedSession::default()
+            }],
+            ..AccountTracker::default()
+        };
+
+        assert!(usage_or_cached(
+            Err("offline".to_string()),
+            &tracker,
+            "codex:live",
+            Some("acct-new"),
+            "new@example.com",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn waybar_reconstructs_legacy_monthly_and_window_caches() {
+        let monthly_tracker = AccountTracker {
+            sessions: vec![TrackedSession {
+                session_id: "codex:monthly".to_string(),
+                account_id: "acct-monthly".to_string(),
+                email: Some("monthly@example.com".to_string()),
+                monthly_usage: Some(TrackedMonthlyUsage {
+                    limit: Some(100.0),
+                    used: Some(25.0),
+                    remaining: Some(75.0),
+                    used_percent: Some(25.0),
+                    remaining_percent: Some(75.0),
+                    resets_at: Some(4102444800),
+                    observed_at: Some("2026-09-02T10:00:00Z".to_string()),
+                    plan_type: Some("business".to_string()),
+                    ..TrackedMonthlyUsage::default()
+                }),
+                ..TrackedSession::default()
+            }],
+            ..AccountTracker::default()
+        };
+        let monthly = usage_or_cached(
+            Err("offline".to_string()),
+            &monthly_tracker,
+            "codex:monthly",
+            Some("acct-monthly"),
+            "monthly@example.com",
+        )
+        .unwrap();
+        assert_eq!(monthly.monthly_limit().unwrap().used_percent, Some(25.0));
+        assert_eq!(
+            monthly.last_fetched_at.as_deref(),
+            Some("2026-09-02T10:00:00Z")
+        );
+        assert_eq!(
+            parse_reset_at(monthly.monthly_limit().unwrap().reset_at.as_ref()),
+            Some(4102444800)
+        );
+
+        let window_tracker = AccountTracker {
+            sessions: vec![TrackedSession {
+                session_id: "codex:window".to_string(),
+                account_id: "acct-window".to_string(),
+                email: Some("window@example.com".to_string()),
+                rate_limit: Some(TrackedRateLimit {
+                    used_percent: Some(30.0),
+                    resets_at: 4102444800,
+                    secondary_used_percent: Some(10.0),
+                    secondary_resets_at: Some(4102444800),
+                    ..TrackedRateLimit::default()
+                }),
+                ..TrackedSession::default()
+            }],
+            ..AccountTracker::default()
+        };
+        let windows = usage_or_cached(
+            Err("offline".to_string()),
+            &window_tracker,
+            "codex:window",
+            Some("acct-window"),
+            "window@example.com",
+        )
+        .unwrap();
+        assert_eq!(windows.five_hour_window().unwrap().used_percent, Some(30.0));
+        assert_eq!(windows.weekly_window().unwrap().used_percent, Some(10.0));
     }
 
     #[test]

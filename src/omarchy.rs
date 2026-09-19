@@ -1,6 +1,11 @@
-use crate::data::{Context, CreditAmount, ResetAt, TrackedQuotaHit, UsageResponse, UsageWindow};
+use crate::data::{
+    Context, CreditAmount, ModelUsageDayTotal, ModelUsageResponse, ResetAt, TokenUsageResponse,
+    TrackedQuotaHit, UsageResponse, UsageWindow,
+};
 use crate::rate_limit::parse_reset_at;
-use crate::waybar::{collect_profile_usage, update_last_quota_hit, ProfileUsage};
+use crate::waybar::{
+    collect_profile_usage_with_model_and_token_usage, update_last_quota_hit, ProfileUsage,
+};
 use chrono::{TimeZone, Utc};
 use serde::Serialize;
 
@@ -26,6 +31,8 @@ struct AccountSnapshot {
     sources: Vec<AccountSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quota: Option<QuotaSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_fetched_at: Option<String>,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -52,6 +59,45 @@ struct QuotaSnapshot {
     monthly: Option<MonthlyQuota>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reset_credits: Option<ResetCredits>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_usage: Option<ModelUsageSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_usage: Option<TokenUsageSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelUsageSnapshot {
+    units: Option<String>,
+    group_by: Option<String>,
+    days: usize,
+    models: Vec<ModelUsageTotalSnapshot>,
+    daily: Vec<ModelUsageDaySnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelUsageTotalSnapshot {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<String>,
+    credits: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelUsageDaySnapshot {
+    date: String,
+    models: Vec<ModelUsageTotalSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsageSnapshot {
+    days: usize,
+    total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_daily_tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,11 +161,13 @@ struct AccountBuilder {
     current: bool,
     sources: Vec<AccountSource>,
     quota: Option<QuotaSnapshot>,
+    last_fetched_at: Option<String>,
+    quota_stale: bool,
     errors: Vec<String>,
 }
 
 pub fn print_snapshot(ctx: &Context) {
-    let entries = collect_profile_usage(ctx);
+    let entries = collect_profile_usage_with_model_and_token_usage(ctx);
     let last_quota_hit = update_last_quota_hit(ctx, &entries);
     let snapshot = build_snapshot(&entries, last_quota_hit.as_ref());
     println!(
@@ -150,6 +198,8 @@ fn build_snapshot(
                     current: entry.is_live,
                     sources: Vec::new(),
                     quota: None,
+                    last_fetched_at: None,
+                    quota_stale: false,
                     errors: Vec::new(),
                 });
                 builders.len() - 1
@@ -170,21 +220,66 @@ fn build_snapshot(
 
         let source = match &entry.usage {
             Ok(usage) => {
-                let candidate = quota_snapshot(usage);
+                let previous_model_usage = builder
+                    .quota
+                    .as_ref()
+                    .and_then(|current| current.model_usage.clone());
+                let previous_token_usage = builder
+                    .quota
+                    .as_ref()
+                    .and_then(|current| current.token_usage.clone());
+                let mut candidate = quota_snapshot(usage);
                 let should_replace = builder.quota.is_none()
                     || builder.quota.as_ref().is_some_and(|current| {
-                        !quota_has_data(current) && quota_has_data(&candidate)
+                        (!quota_has_data(current) && quota_has_data(&candidate))
+                            || (builder.quota_stale && !usage.cached && quota_has_data(&candidate))
                     });
                 if should_replace {
+                    if candidate.model_usage.is_none() {
+                        candidate.model_usage = previous_model_usage;
+                    }
+                    if candidate.token_usage.is_none() {
+                        candidate.token_usage = previous_token_usage;
+                    }
+                    builder.quota_stale = usage.cached;
                     builder.quota = Some(candidate);
+                    builder.last_fetched_at = usage.last_fetched_at.clone();
+                } else {
+                    if builder
+                        .quota
+                        .as_ref()
+                        .is_some_and(|current| current.model_usage.is_none())
+                        && candidate.model_usage.is_some()
+                    {
+                        if let Some(quota) = builder.quota.as_mut() {
+                            quota.model_usage = candidate.model_usage;
+                        }
+                    }
+                    if builder
+                        .quota
+                        .as_ref()
+                        .is_some_and(|current| current.token_usage.is_none())
+                        && candidate.token_usage.is_some()
+                    {
+                        if let Some(quota) = builder.quota.as_mut() {
+                            quota.token_usage = candidate.token_usage;
+                        }
+                    }
+                }
+                let error = usage
+                    .cache_error
+                    .as_ref()
+                    .map(|error| format!("cached quota; refresh failed: {}", error));
+                if let Some(error) = error.as_ref() {
+                    builder.errors.push(error.clone());
                 }
                 AccountSource {
                     provider: entry.provider.to_string(),
                     profile: entry.name.clone(),
                     live: entry.is_live,
                     switchable: !entry.is_live,
-                    status: "ok",
-                    error: None,
+                    status: if usage.cached { "stale" } else { "ok" },
+                    error,
                 }
             }
             Err(error) => {
@@ -206,7 +301,11 @@ fn build_snapshot(
         .into_iter()
         .map(|builder| {
             let status = if builder.quota.is_some() {
-                "ok"
+                if builder.quota_stale {
+                    "stale"
+                } else {
+                    "ok"
+                }
             } else {
                 "unavailable"
             };
@@ -218,6 +317,7 @@ fn build_snapshot(
                 current: builder.current,
                 sources: builder.sources,
                 quota: builder.quota,
+                last_fetched_at: builder.last_fetched_at,
                 status,
                 error: builder.errors.into_iter().next(),
             }
@@ -249,7 +349,11 @@ fn is_placeholder(value: &str) -> bool {
 }
 
 fn quota_has_data(quota: &QuotaSnapshot) -> bool {
-    !quota.windows.is_empty() || quota.monthly.is_some() || quota.reset_credits.is_some()
+    !quota.windows.is_empty()
+        || quota.monthly.is_some()
+        || quota.reset_credits.is_some()
+        || quota.model_usage.is_some()
+        || quota.token_usage.is_some()
 }
 
 fn quota_snapshot(usage: &UsageResponse) -> QuotaSnapshot {
@@ -292,11 +396,65 @@ fn quota_snapshot(usage: &UsageResponse) -> QuotaSnapshot {
                 .collect(),
         });
 
+    let model_usage = usage.model_usage.as_ref().map(model_usage_snapshot);
+    let token_usage = usage
+        .token_usage
+        .as_ref()
+        .filter(|usage| usage.day_count() > 0)
+        .map(token_usage_snapshot);
+
     QuotaSnapshot {
         plan_type: usage.plan_type.clone(),
         windows,
         monthly,
         reset_credits,
+        model_usage,
+        token_usage,
+    }
+}
+
+fn model_usage_snapshot(model_usage: &ModelUsageResponse) -> ModelUsageSnapshot {
+    ModelUsageSnapshot {
+        units: model_usage.units.clone(),
+        group_by: model_usage.group_by.clone(),
+        days: model_usage.day_count(),
+        models: model_usage
+            .totals()
+            .into_iter()
+            .map(|total| ModelUsageTotalSnapshot {
+                model: total.model,
+                speed: total.speed,
+                credits: total.credits,
+            })
+            .collect(),
+        daily: model_usage
+            .daily_totals()
+            .iter()
+            .map(model_usage_day_snapshot)
+            .collect(),
+    }
+}
+
+fn model_usage_day_snapshot(day: &ModelUsageDayTotal) -> ModelUsageDaySnapshot {
+    ModelUsageDaySnapshot {
+        date: day.date.clone(),
+        models: day
+            .models
+            .iter()
+            .map(|total| ModelUsageTotalSnapshot {
+                model: total.model.clone(),
+                speed: total.speed.clone(),
+                credits: total.credits,
+            })
+            .collect(),
+    }
+}
+
+fn token_usage_snapshot(token_usage: &TokenUsageResponse) -> TokenUsageSnapshot {
+    TokenUsageSnapshot {
+        days: token_usage.day_count(),
+        total_tokens: token_usage.total_daily_tokens(),
+        peak_daily_tokens: token_usage.peak_daily_tokens(),
     }
 }
 
@@ -338,7 +496,8 @@ fn last_quota_hit_snapshot(hit: &TrackedQuotaHit) -> LastQuotaHit {
 mod tests {
     use super::{
         account_key, build_snapshot, credit_amount, is_placeholder, print_snapshot, quota_has_data,
-        quota_snapshot, reset_at_string, MonthlyQuota, QuotaSnapshot, ResetCredits,
+        quota_snapshot, reset_at_string, ModelUsageSnapshot, MonthlyQuota, QuotaSnapshot,
+        ResetCredits, TokenUsageSnapshot,
     };
     use crate::data::{Context, CreditAmount, ResetAt, TrackedQuotaHit, UsageResponse};
     use crate::waybar::ProfileUsage;
@@ -532,6 +691,8 @@ mod tests {
             windows: Vec::new(),
             monthly: None,
             reset_credits: None,
+            model_usage: None,
+            token_usage: None,
         };
         assert!(!quota_has_data(&empty));
         assert!(quota_has_data(&QuotaSnapshot {
@@ -563,6 +724,24 @@ mod tests {
             }),
             ..empty_snapshot()
         }));
+        assert!(quota_has_data(&QuotaSnapshot {
+            model_usage: Some(ModelUsageSnapshot {
+                units: Some("percent".to_string()),
+                group_by: Some("day".to_string()),
+                days: 1,
+                models: Vec::new(),
+                daily: Vec::new(),
+            }),
+            ..empty_snapshot()
+        }));
+        assert!(quota_has_data(&QuotaSnapshot {
+            token_usage: Some(TokenUsageSnapshot {
+                days: 1,
+                total_tokens: 100,
+                peak_daily_tokens: Some(100),
+            }),
+            ..empty_snapshot()
+        }));
 
         assert!(reset_at_string(None).is_none());
         assert!(reset_at_string(Some(&ResetAt::Rfc3339("bad".to_string()))).is_none());
@@ -576,6 +755,8 @@ mod tests {
             windows: Vec::new(),
             monthly: None,
             reset_credits: None,
+            model_usage: None,
+            token_usage: None,
         }
     }
 
@@ -610,7 +791,13 @@ mod tests {
                 "used_percent": 1.0, "remaining_percent": 99.0, "reset_at": 4102444800u64
             }},
             "rate_limit_reset_credits": {"available_count": 1, "applicable_available_count": 0,
-                "credits": [{"status": "available", "title": "Full reset", "expires_at": "2100-01-01T00:00:00Z"}]}
+                "credits": [{"status": "available", "title": "Full reset", "expires_at": "2100-01-01T00:00:00Z"}]},
+            "model_usage": {"units": "percent", "group_by": "day", "data": [{"date": "2026-09-04", "models": [
+                {"model": "gpt-5.6-sol", "speed": "standard", "credits": 12.5}
+            ]}]},
+            "token_usage": {"summary": {"peakDailyTokens": 700}, "dailyUsageBuckets": [
+                {"startDate": "2026-09-04", "tokens": 1200}
+            ]}
         }))
         .unwrap();
 
@@ -628,6 +815,258 @@ mod tests {
             Some(1)
         );
         assert_eq!(quota.reset_credits.as_ref().unwrap().credits.len(), 1);
+        let model_usage = quota.model_usage.as_ref().unwrap();
+        assert_eq!(model_usage.units.as_deref(), Some("percent"));
+        assert_eq!(model_usage.days, 1);
+        assert_eq!(model_usage.models.len(), 1);
+        assert_eq!(model_usage.models[0].model, "gpt-5.6-sol");
+        assert_eq!(model_usage.models[0].credits, 12.5);
+        assert_eq!(model_usage.daily.len(), 1);
+        assert_eq!(model_usage.daily[0].date, "2026-09-04");
+        assert_eq!(model_usage.daily[0].models[0].credits, 12.5);
+        let token_usage = quota.token_usage.as_ref().unwrap();
+        assert_eq!(token_usage.days, 1);
+        assert_eq!(token_usage.total_tokens, 1200);
+        assert_eq!(token_usage.peak_daily_tokens, Some(700));
+    }
+
+    #[test]
+    fn merges_model_and_token_usage_across_account_sources() {
+        let model_only: UsageResponse = serde_json::from_value(serde_json::json!({
+            "model_usage": {"units": "percent", "data": [{"date": "2026-09-04", "models": [
+                {"model": "gpt-5.6-sol", "credits": 12.5}
+            ]}]}
+        }))
+        .unwrap();
+        let token_only: UsageResponse = serde_json::from_value(serde_json::json!({
+            "token_usage": {"dailyUsageBuckets": [
+                {"startDate": "2026-09-04", "tokens": 1200}
+            ]}
+        }))
+        .unwrap();
+
+        let snapshot = build_snapshot(
+            &[
+                entry(
+                    "codex",
+                    "work",
+                    "person@example.com",
+                    Some("acct-work"),
+                    true,
+                    Ok(model_only),
+                ),
+                entry(
+                    "pi",
+                    "work-pi",
+                    "person@example.com",
+                    Some("acct-work"),
+                    false,
+                    Ok(token_only),
+                ),
+            ],
+            None,
+        );
+
+        let quota = snapshot.accounts[0].quota.as_ref().unwrap();
+        assert!(quota.model_usage.is_some());
+        assert_eq!(quota.token_usage.as_ref().unwrap().total_tokens, 1200);
+    }
+
+    #[test]
+    fn preserves_cached_quota_in_snapshot_and_marks_refresh_failure() {
+        let mut usage: UsageResponse = serde_json::from_value(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {"used_percent": 42.0, "reset_at": 4102444800u64}
+            }
+        }))
+        .unwrap();
+        usage.cached = true;
+        usage.cache_error = Some("network unavailable".to_string());
+        usage.last_fetched_at = Some("2026-09-02T10:00:00Z".to_string());
+
+        let snapshot = build_snapshot(
+            &[entry(
+                "codex",
+                "work",
+                "person@example.com",
+                Some("acct-work"),
+                true,
+                Ok(usage),
+            )],
+            None,
+        );
+
+        assert_eq!(snapshot.accounts[0].status, "stale");
+        assert_eq!(snapshot.accounts[0].sources[0].status, "stale");
+        assert_eq!(
+            snapshot.accounts[0].sources[0].error.as_deref(),
+            Some("cached quota; refresh failed: network unavailable")
+        );
+        assert_eq!(
+            snapshot.accounts[0].quota.as_ref().unwrap().windows[0].used_percent,
+            Some(42.0)
+        );
+        assert_eq!(
+            snapshot.accounts[0].last_fetched_at.as_deref(),
+            Some("2026-09-02T10:00:00Z")
+        );
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["accounts"][0]["lastFetchedAt"], "2026-09-02T10:00:00Z");
+    }
+
+    #[test]
+    fn only_replaces_cached_quota_with_fresh_account_data() {
+        let full: UsageResponse = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {"used_percent": 25.0, "reset_at": 4102444800u64}}
+        }))
+        .unwrap();
+        let empty: UsageResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        let unchanged = build_snapshot(
+            &[
+                entry(
+                    "codex",
+                    "work",
+                    "person@example.com",
+                    Some("acct"),
+                    true,
+                    Ok(full.clone()),
+                ),
+                entry(
+                    "pi",
+                    "work-pi",
+                    "person@example.com",
+                    Some("acct"),
+                    false,
+                    Ok(empty.clone()),
+                ),
+            ],
+            None,
+        );
+        assert_eq!(
+            unchanged.accounts[0].quota.as_ref().unwrap().windows[0].used_percent,
+            Some(25.0)
+        );
+
+        let empty_only = build_snapshot(
+            &[
+                entry(
+                    "codex",
+                    "work",
+                    "person@example.com",
+                    Some("acct-empty"),
+                    true,
+                    Ok(empty.clone()),
+                ),
+                entry(
+                    "pi",
+                    "work-pi",
+                    "person@example.com",
+                    Some("acct-empty"),
+                    false,
+                    Ok(empty.clone()),
+                ),
+            ],
+            None,
+        );
+        assert!(empty_only.accounts[0]
+            .quota
+            .as_ref()
+            .unwrap()
+            .windows
+            .is_empty());
+
+        let mut cached = full.clone();
+        cached.cached = true;
+        let refreshed = build_snapshot(
+            &[
+                entry(
+                    "codex",
+                    "work",
+                    "person@example.com",
+                    Some("acct-refresh"),
+                    true,
+                    Ok(cached.clone()),
+                ),
+                entry(
+                    "pi",
+                    "work-pi",
+                    "person@example.com",
+                    Some("acct-refresh"),
+                    false,
+                    Ok(full),
+                ),
+            ],
+            None,
+        );
+        assert_eq!(refreshed.accounts[0].status, "ok");
+
+        let stale = build_snapshot(
+            &[
+                entry(
+                    "codex",
+                    "work",
+                    "person@example.com",
+                    Some("acct-stale"),
+                    true,
+                    Ok(cached),
+                ),
+                entry(
+                    "pi",
+                    "work-pi",
+                    "person@example.com",
+                    Some("acct-stale"),
+                    false,
+                    Ok(empty),
+                ),
+            ],
+            None,
+        );
+        assert_eq!(stale.accounts[0].status, "stale");
+
+        let model_only: UsageResponse = serde_json::from_value(serde_json::json!({
+            "model_usage": {
+                "units": "percent",
+                "data": [{"models":[{"model":"gpt-5.6-sol","credits":2.0}]}]
+            }
+        }))
+        .unwrap();
+        let model_merged = build_snapshot(
+            &[
+                entry(
+                    "codex",
+                    "work",
+                    "person@example.com",
+                    Some("acct-model"),
+                    true,
+                    Ok(serde_json::from_value(serde_json::json!({
+                        "rate_limit": {"primary_window": {"used_percent": 25.0}}
+                    }))
+                    .unwrap()),
+                ),
+                entry(
+                    "pi",
+                    "work-pi",
+                    "person@example.com",
+                    Some("acct-model"),
+                    false,
+                    Ok(model_only),
+                ),
+            ],
+            None,
+        );
+        assert_eq!(
+            model_merged.accounts[0]
+                .quota
+                .as_ref()
+                .unwrap()
+                .model_usage
+                .as_ref()
+                .unwrap()
+                .models[0]
+                .model,
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]

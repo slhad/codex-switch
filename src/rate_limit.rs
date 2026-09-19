@@ -1,14 +1,23 @@
 use crate::data::{
-    read_auth, read_pi_auth, AuthFile, Context, CreditAmount, PiOpenAiCodexAuth,
-    RateLimitResetCredits, ResetAt, UsageResponse, UsageWindow,
+    read_auth, read_pi_auth, AuthFile, Context, CreditAmount, ModelUsageResponse,
+    PiOpenAiCodexAuth, RateLimitResetCredits, ResetAt, TokenUsageResponse, UsageResponse,
+    UsageWindow,
 };
 use crate::jwt::decode_token_payload;
 use chrono::{DateTime, Days, Local, TimeZone, Utc};
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const MODEL_USAGE_URL: &str =
+    "https://chatgpt.com/backend-api/wham/usage/daily-token-usage-breakdown";
+const MODEL_USAGE_LOOKBACK_DAYS: u64 = 30;
 const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const TOKEN_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 
@@ -18,6 +27,235 @@ pub fn fetch_rate_limit(ctx: &Context) -> Result<UsageResponse, String> {
 
 pub fn fetch_rate_limit_read_only(ctx: &Context) -> Result<UsageResponse, String> {
     fetch_rate_limit_for_auth_path_read_only(&ctx.live_auth)
+}
+
+pub fn fetch_model_usage_for_auth(auth: &AuthFile) -> Result<ModelUsageResponse, String> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+    let access_token = auth
+        .tokens
+        .access_token
+        .as_deref()
+        .ok_or_else(|| "missing OAuth access token in ~/.codex/auth.json".to_string())?;
+    fetch_model_usage_with_token(&client, access_token, auth.tokens.account_id.as_deref())
+}
+
+pub fn fetch_pi_model_usage_for_auth(
+    auth: &PiOpenAiCodexAuth,
+) -> Result<ModelUsageResponse, String> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+    fetch_model_usage_with_token(&client, &auth.access, auth.account_id.as_deref())
+}
+
+pub fn fetch_token_usage_for_auth(auth: &AuthFile) -> Result<TokenUsageResponse, String> {
+    let access_token = auth
+        .tokens
+        .access_token
+        .as_deref()
+        .ok_or_else(|| "missing OAuth access token in ~/.codex/auth.json".to_string())?;
+    let (account_id, plan_type) =
+        token_usage_metadata(&auth.tokens.id_token, auth.tokens.account_id.clone());
+    fetch_token_usage_with_app_server(access_token, account_id.as_deref(), plan_type.as_deref())
+}
+
+pub fn fetch_pi_token_usage_for_auth(
+    auth: &PiOpenAiCodexAuth,
+) -> Result<TokenUsageResponse, String> {
+    let (account_id, plan_type) = token_usage_metadata(&auth.access, auth.account_id.clone());
+    fetch_token_usage_with_app_server(&auth.access, account_id.as_deref(), plan_type.as_deref())
+}
+
+fn token_usage_metadata(
+    token: &str,
+    account_id: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let claims = decode_token_payload(token);
+    let account_id = account_id.or_else(|| {
+        claims
+            .as_ref()
+            .and_then(|payload| payload.openai_auth.as_ref())
+            .and_then(|auth| auth.chatgpt_account_id.clone())
+    });
+    let plan_type = claims
+        .as_ref()
+        .and_then(|payload| payload.openai_auth.as_ref())
+        .and_then(|auth| auth.chatgpt_plan_type.clone());
+    (account_id, plan_type)
+}
+
+fn fetch_token_usage_with_app_server(
+    access_token: &str,
+    account_id: Option<&str>,
+    plan_type: Option<&str>,
+) -> Result<TokenUsageResponse, String> {
+    let account_id = account_id
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing ChatGPT account id for account usage API".to_string())?;
+
+    let mut child = Command::new("codex")
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to start codex app-server: {}", error))?;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("codex app-server did not provide stdin".to_string());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("codex app-server did not provide stdout".to_string());
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.map_err(|error| error.to_string());
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = (|| {
+        let initialize_params = serde_json::json!({
+            "clientInfo": {
+                "name": "codex-switch",
+                "title": "Codex Switch",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {"experimentalApi": true}
+        });
+        rpc_call(
+            &mut stdin,
+            &receiver,
+            1,
+            "initialize",
+            Some(initialize_params),
+        )?;
+        write_rpc(&mut stdin, serde_json::json!({"method": "initialized"}))?;
+
+        let mut login_params = serde_json::json!({
+            "type": "chatgptAuthTokens",
+            "accessToken": access_token,
+            "chatgptAccountId": account_id
+        });
+        if let Some(plan_type) = plan_type.filter(|value| !value.is_empty()) {
+            login_params["chatgptPlanType"] = serde_json::json!(plan_type);
+        }
+        rpc_call(
+            &mut stdin,
+            &receiver,
+            2,
+            "account/login/start",
+            Some(login_params),
+        )?;
+
+        let result = rpc_call(&mut stdin, &receiver, 3, "account/usage/read", None)?;
+        serde_json::from_value(result)
+            .map_err(|error| format!("invalid account usage response: {}", error))
+    })();
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn write_rpc(stdin: &mut ChildStdin, message: serde_json::Value) -> Result<(), String> {
+    serde_json::to_writer(&mut *stdin, &message)
+        .map_err(|error| format!("failed to write app-server request: {}", error))?;
+    stdin
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to write app-server request: {}", error))?;
+    stdin
+        .flush()
+        .map_err(|error| format!("failed to flush app-server request: {}", error))
+}
+
+fn rpc_call(
+    stdin: &mut ChildStdin,
+    receiver: &Receiver<Result<String, String>>,
+    id: u64,
+    method: &str,
+    params: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut request = serde_json::json!({"method": method, "id": id});
+    if let Some(params) = params {
+        request["params"] = params;
+    }
+    write_rpc(stdin, request)?;
+    read_rpc_response(stdin, receiver, id, method)
+}
+
+fn read_rpc_response(
+    stdin: &mut ChildStdin,
+    receiver: &Receiver<Result<String, String>>,
+    id: u64,
+    method: &str,
+) -> Result<serde_json::Value, String> {
+    const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("timed out waiting for codex app-server {}", method));
+        }
+        let line = receiver
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => {
+                    format!("timed out waiting for codex app-server {}", method)
+                }
+                mpsc::RecvTimeoutError::Disconnected => {
+                    format!("codex app-server exited while handling {}", method)
+                }
+            })??;
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid codex app-server response: {}", error))?;
+
+        if value.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+            if let Some(error) = value.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown app-server error");
+                return Err(format!("codex app-server {} failed: {}", method, message));
+            }
+            return Ok(value
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
+        }
+
+        if value
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+            && value.get("id").is_some()
+        {
+            write_rpc(
+                stdin,
+                serde_json::json!({
+                    "id": value["id"].clone(),
+                    "error": {
+                        "code": -32601,
+                        "message": "unsupported app-server request"
+                    }
+                }),
+            )?;
+        }
+    }
 }
 
 pub fn fetch_rate_limit_for_auth_path_read_only(path: &Path) -> Result<UsageResponse, String> {
@@ -215,6 +453,45 @@ fn send_usage_request_with_token(
         .map_err(|e| format!("usage request failed: {}", e))
 }
 
+fn fetch_model_usage_with_token(
+    client: &Client,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<ModelUsageResponse, String> {
+    let response = send_model_usage_request_with_token(client, access_token, account_id)?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("401 unauthorized from model usage API".to_string());
+    }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err("403 forbidden from model usage API".to_string());
+    }
+
+    response
+        .error_for_status()
+        .map_err(|e| format!("model usage request failed: {}", e))?
+        .json::<ModelUsageResponse>()
+        .map_err(|e| format!("invalid model usage response: {}", e))
+}
+
+fn send_model_usage_request_with_token(
+    client: &Client,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<reqwest::blocking::Response, String> {
+    let url = model_usage_url(Utc::now().date_naive());
+    send_backend_get_with_token(client, &url, access_token, account_id)
+        .map_err(|e| format!("model usage request failed: {}", e))
+}
+
+fn model_usage_url(today: chrono::NaiveDate) -> String {
+    let start = today - Days::new(MODEL_USAGE_LOOKBACK_DAYS - 1);
+    let end = today;
+    format!(
+        "{}?start_date={}&end_date={}&group_by=day",
+        MODEL_USAGE_URL, start, end
+    )
+}
+
 fn send_reset_credits_request_with_token(
     client: &Client,
     access_token: &str,
@@ -232,6 +509,8 @@ fn send_backend_get_with_token(
 ) -> Result<reqwest::blocking::Response, String> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
+    headers.insert(USER_AGENT, HeaderValue::from_static("codex-switch"));
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {}", access_token))
@@ -512,14 +791,14 @@ pub fn parse_reset_at(value: Option<&ResetAt>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_client_id, merge_reset_credit_details, needs_pi_refresh, needs_refresh,
-        parse_reset_at, pi_client_id, write_pi_auth_at_path_if_unchanged,
+        codex_client_id, merge_reset_credit_details, model_usage_url, needs_pi_refresh,
+        needs_refresh, parse_reset_at, pi_client_id, write_pi_auth_at_path_if_unchanged,
     };
     use crate::data::{
         AuthFile, Context, PiOpenAiCodexAuth, RateLimitResetCredits, ResetAt, Tokens, UsageResponse,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use chrono::{Duration, Utc};
+    use chrono::{Duration, NaiveDate, Utc};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -563,6 +842,15 @@ mod tests {
     fn parses_epoch_reset_timestamp() {
         let ts = parse_reset_at(Some(&ResetAt::Epoch(1_781_569_991)));
         assert_eq!(ts, Some(1_781_569_991));
+    }
+
+    #[test]
+    fn requests_a_thirty_day_model_usage_window_through_today() {
+        let url = model_usage_url(NaiveDate::from_ymd_opt(2026, 9, 18).unwrap());
+        assert_eq!(
+            url,
+            "https://chatgpt.com/backend-api/wham/usage/daily-token-usage-breakdown?start_date=2026-08-20&end_date=2026-09-18&group_by=day"
+        );
     }
 
     #[test]

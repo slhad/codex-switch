@@ -2,7 +2,7 @@ use chrono::Utc;
 
 use crate::data::{
     AccountTracker, Context, TrackedAuthSnapshot, TrackedMonthlyUsage, TrackedRateLimit,
-    TrackedSession,
+    TrackedSession, UsageResponse,
 };
 
 fn normalize_tracker(mut tracker: AccountTracker) -> AccountTracker {
@@ -194,6 +194,12 @@ pub fn upsert_session<'a>(
         });
 
     let entry = &mut tracker.sessions[idx];
+    if !account_id.is_empty() && entry.account_id != account_id {
+        entry.last_usage = None;
+        entry.last_fetched_at = None;
+        entry.rate_limit = None;
+        entry.monthly_usage = None;
+    }
     entry.session_id = session_id.to_string();
     if provider.is_some() {
         entry.provider = provider;
@@ -272,6 +278,39 @@ pub fn update_monthly_usage(
     entry.rate_limit = None;
 }
 
+/// Keep the complete successful usage response so display clients can remain
+/// useful when the usage API is temporarily unreachable.
+pub fn update_usage_cache(entry: &mut TrackedSession, usage: &UsageResponse) {
+    if usage.rate_limit.is_none()
+        && usage.spend_control.is_none()
+        && usage.rate_limit_reset_credits.is_none()
+        && usage.model_usage.is_none()
+        && usage.token_usage.is_none()
+    {
+        return;
+    }
+
+    entry.last_fetched_at = usage
+        .last_fetched_at
+        .clone()
+        .or_else(|| Some(Utc::now().to_rfc3339()));
+
+    let cached_model_usage = entry
+        .last_usage
+        .as_ref()
+        .and_then(|previous| previous.model_usage.clone());
+    let cached_token_usage = entry
+        .last_usage
+        .as_ref()
+        .and_then(|previous| previous.token_usage.clone());
+    let mut snapshot = usage.clone();
+    snapshot.model_usage = snapshot.model_usage.or(cached_model_usage);
+    snapshot.token_usage = snapshot.token_usage.or(cached_token_usage);
+    snapshot.cached = false;
+    snapshot.cache_error = None;
+    entry.last_usage = Some(snapshot);
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -280,7 +319,7 @@ mod tests {
     use super::{
         fingerprint_secret, list_sessions, load_last_snapshot, load_tracker, remove_session,
         save_tracker, save_tracker_result, snapshot_live_auth, update_monthly_usage,
-        update_rate_limit, upsert_session,
+        update_rate_limit, update_usage_cache, upsert_session,
     };
     use crate::data::{
         AccountTracker, Context, TrackedAuthSnapshot, TrackedQuotaHit, TrackedSession,
@@ -330,12 +369,14 @@ mod tests {
     #[test]
     fn save_tracker_round_trips_last_snapshot() {
         let (ctx, base) = test_context("tracker-roundtrip");
-        let mut tracker = AccountTracker::default();
-        tracker.last_snapshot = Some(TrackedAuthSnapshot {
-            auth_json: "{\"tokens\":{\"id_token\":\"id\"}}".to_string(),
-            observed_at: Some("2026-01-01T00:00:00Z".to_string()),
-            profile: Some("personal".to_string()),
-        });
+        let tracker = AccountTracker {
+            last_snapshot: Some(TrackedAuthSnapshot {
+                auth_json: "{\"tokens\":{\"id_token\":\"id\"}}".to_string(),
+                observed_at: Some("2026-01-01T00:00:00Z".to_string()),
+                profile: Some("personal".to_string()),
+            }),
+            ..AccountTracker::default()
+        };
 
         save_tracker(&ctx, &tracker);
 
@@ -455,6 +496,171 @@ mod tests {
     }
 
     #[test]
+    fn usage_cache_round_trips_and_ignores_empty_responses() {
+        let (ctx, base) = test_context("usage-cache");
+        let mut session = TrackedSession {
+            session_id: "codex:live".to_string(),
+            ..TrackedSession::default()
+        };
+        let mut usage: crate::data::UsageResponse = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":42,"reset_at":4102444800,"limit_window_seconds":18000}}}"#,
+        )
+        .unwrap();
+        usage.last_fetched_at = Some("2026-09-02T10:00:00Z".to_string());
+        let mut empty: crate::data::UsageResponse = serde_json::from_str("{}").unwrap();
+        empty.last_fetched_at = Some("2026-09-02T10:05:00Z".to_string());
+
+        update_usage_cache(&mut session, &usage);
+        assert_eq!(
+            session
+                .last_usage
+                .as_ref()
+                .unwrap()
+                .five_hour_window()
+                .unwrap()
+                .used_percent,
+            Some(42.0)
+        );
+        assert!(!session.last_usage.as_ref().unwrap().cached);
+        assert_eq!(
+            session.last_fetched_at.as_deref(),
+            Some("2026-09-02T10:00:00Z")
+        );
+
+        update_usage_cache(&mut session, &empty);
+        assert_eq!(
+            session
+                .last_usage
+                .as_ref()
+                .unwrap()
+                .five_hour_window()
+                .unwrap()
+                .used_percent,
+            Some(42.0)
+        );
+        assert_eq!(
+            session.last_fetched_at.as_deref(),
+            Some("2026-09-02T10:00:00Z")
+        );
+
+        let tracker = AccountTracker {
+            sessions: vec![session],
+            ..AccountTracker::default()
+        };
+        save_tracker(&ctx, &tracker);
+        let loaded = load_tracker(&ctx);
+        assert_eq!(
+            loaded.sessions[0]
+                .last_usage
+                .as_ref()
+                .and_then(|usage| usage.five_hour_window())
+                .and_then(|window| window.used_percent),
+            Some(42.0)
+        );
+        assert_eq!(
+            loaded.sessions[0].last_fetched_at.as_deref(),
+            Some("2026-09-02T10:00:00Z")
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn usage_cache_accepts_each_supported_usage_section() {
+        let mut session = TrackedSession::default();
+        let monthly: crate::data::UsageResponse =
+            serde_json::from_str(r#"{"spend_control":{"individual_limit":{"used_percent":25}}}"#)
+                .unwrap();
+        let reset_credits: crate::data::UsageResponse =
+            serde_json::from_str(r#"{"rate_limit_reset_credits":{"available_count":1}}"#).unwrap();
+        let model_usage: crate::data::UsageResponse = serde_json::from_str(
+            r#"{"model_usage":{"units":"percent","data":[{"models":[{"model":"gpt-5.6-sol","credits":4}]}]}}"#,
+        )
+        .unwrap();
+
+        update_usage_cache(&mut session, &monthly);
+        assert!(session.last_usage.is_some());
+        update_usage_cache(&mut session, &model_usage);
+        assert!(session
+            .last_usage
+            .as_ref()
+            .and_then(|usage| usage.model_usage.as_ref())
+            .is_some());
+        update_usage_cache(&mut session, &reset_credits);
+        assert_eq!(
+            session
+                .last_usage
+                .as_ref()
+                .and_then(|usage| usage.rate_limit_reset_credits.as_ref())
+                .and_then(|credits| credits.available_count),
+            Some(1)
+        );
+        assert_eq!(
+            session
+                .last_usage
+                .as_ref()
+                .and_then(|usage| usage.model_usage.as_ref())
+                .and_then(|usage| usage.totals().into_iter().next())
+                .map(|usage| usage.credits),
+            Some(4.0)
+        );
+    }
+
+    #[test]
+    fn changing_session_account_clears_old_usage_cache() {
+        let mut tracker = AccountTracker {
+            sessions: vec![TrackedSession {
+                session_id: "codex:live".to_string(),
+                account_id: "acct-old".to_string(),
+                last_usage: Some(
+                    serde_json::from_str(
+                        r#"{"rate_limit":{"primary_window":{"used_percent":20}}}"#,
+                    )
+                    .unwrap(),
+                ),
+                last_fetched_at: Some("2026-09-02T10:00:00Z".to_string()),
+                ..TrackedSession::default()
+            }],
+            ..AccountTracker::default()
+        };
+
+        upsert_session(
+            &mut tracker,
+            "codex:live",
+            None,
+            None,
+            "acct-new",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+
+        assert!(tracker.sessions[0].last_usage.is_none());
+        assert!(tracker.sessions[0].last_fetched_at.is_none());
+        assert!(tracker.sessions[0].rate_limit.is_none());
+        assert!(tracker.sessions[0].monthly_usage.is_none());
+
+        upsert_session(
+            &mut tracker,
+            "codex:live",
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+    }
+
+    #[test]
     fn lists_session_ids_with_context_in_sorted_order() {
         let (ctx, base) = test_context("list-sessions");
         save_tracker(
@@ -520,6 +726,40 @@ mod tests {
 
         std::fs::write(&ctx.tracker_file, "invalid").unwrap();
         assert!(remove_session(&ctx, "codex:live").is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn removing_other_session_preserves_last_quota_hit() {
+        let (ctx, base) = test_context("remove-session-unrelated-hit");
+        save_tracker(
+            &ctx,
+            &AccountTracker {
+                sessions: vec![
+                    TrackedSession {
+                        session_id: "pi:profile:old".to_string(),
+                        ..TrackedSession::default()
+                    },
+                    TrackedSession {
+                        session_id: "codex:live".to_string(),
+                        ..TrackedSession::default()
+                    },
+                ],
+                last_quota_hit: Some(TrackedQuotaHit {
+                    session_id: Some("codex:live".to_string()),
+                    ..TrackedQuotaHit::default()
+                }),
+                ..AccountTracker::default()
+            },
+        );
+
+        assert!(remove_session(&ctx, "pi:profile:old").unwrap());
+        assert_eq!(
+            load_tracker(&ctx)
+                .last_quota_hit
+                .and_then(|hit| hit.session_id),
+            Some("codex:live".to_string())
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 
